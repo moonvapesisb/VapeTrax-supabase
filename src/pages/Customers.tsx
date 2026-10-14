@@ -1,0 +1,475 @@
+﻿import React, { useState, useMemo } from 'react';
+import { 
+  Users, 
+  Search, 
+  Plus, 
+  Edit2, 
+  Trash2, 
+  Phone, 
+  Mail, 
+  CreditCard, 
+  ArrowUpDown,
+  X,
+  UserPlus,
+  History
+} from 'lucide-react';
+import { useData } from '../contexts/DataContext';
+import { formatCurrency, cn } from '../lib/utils';
+import LoadingSpinner from '../components/ui/LoadingSpinner';
+import { supabase } from '../lib/supabase';
+import { removeLocalRows } from '../lib/liveStock';
+import { reauthenticateForSensitiveAction, requiresPasswordReauth } from '../lib/secureAction';
+import { useAuth } from '../contexts/AuthContext';
+import toast from 'react-hot-toast';
+import AddCreditModal from '../components/credits/AddCreditModal';
+import { toDisplayDate } from '../lib/dates';
+import ConfirmBulkDeleteModal from '../components/ui/ConfirmBulkDeleteModal';
+import CustomerCreditHistoryModal from '../components/credits/CustomerCreditHistoryModal';
+import CustomerModal from '../components/customers/CustomerModal';
+import { announceDeleted } from '../lib/liveSync';
+import { friendlyError } from '../lib/errors';
+import { MAX_DELETE_AT_ONCE, REASONS, useShopPermissions } from '../lib/permissions';
+
+/** The server refuses more than 25 deletes in one request (from migration 20261012100000). */
+const isMassDeleteBlocked = (error: any) =>
+  error?.code === 'PT422' ||
+  /mass_delete_blocked/i.test(`${error?.message ?? ''} ${error?.details ?? ''} ${error?.hint ?? ''}`);
+
+const MASS_DELETE_MESSAGE =
+  `For safety, at most ${MAX_DELETE_AT_ONCE} customers can be deleted at once. Nothing was deleted: select ${MAX_DELETE_AT_ONCE} or fewer and try again.`;
+
+/**
+ * Deletes customers on the server, then re-reads them to learn what happened.
+ * Before migration 20261012100000 a delete really deletes. After it, the server
+ * archives the customer instead: it reports 0 rows and no error, and hides the row.
+ * Either way a customer that can no longer be read is gone, so it also leaves this
+ * device's copy. A customer that can still be read was not deleted.
+ * Returns null when the delete went through but the re-read failed.
+ */
+const deleteCustomersOnServer = async (shopId: string, ids: string[]) => {
+  const { count, error } = await supabase
+    .from('customers')
+    .delete({ count: 'exact' })
+    .eq('shopId', shopId)
+    .in('id', ids);
+  if (error) throw error;
+  const stillThere = new Set<string>();
+  for (let i = 0; i < ids.length; i += 100) {
+    const { data, error: readError } = await supabase
+      .from('customers')
+      .select('id')
+      .eq('shopId', shopId)
+      .in('id', ids.slice(i, i + 100));
+    if (readError) return null;
+    for (const row of data || []) stillThere.add(row.id);
+  }
+  const removed = ids.filter(id => !stillThere.has(id));
+  if (removed.length) {
+    // Write-through, and the shop's other devices are told (a delete archives the row).
+    await removeLocalRows('customers', removed);
+    announceDeleted('customers', removed);
+  }
+  return {
+    removed,
+    notRemoved: ids.filter(id => stillThere.has(id)),
+    archived: (count ?? 0) < removed.length,
+  };
+};
+
+const Customers: React.FC = () => {
+  const { shopId, currentUser } = useAuth();
+  const { customers, customersLoading: loading, refetchCustomers } = useData();
+  const [searchTerm, setSearchTerm] = useState('');
+  const [showAddModal, setShowAddModal] = useState(false);
+  const [editingCustomer, setEditingCustomer] = useState<any | null>(null);
+  const [showAddCreditModal, setShowAddCreditModal] = useState(false);
+  const [creditCustomerId, setCreditCustomerId] = useState<string | undefined>(undefined);
+  const [showHistoryModal, setShowHistoryModal] = useState<any | null>(null);
+  const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  const [showBulkDeleteModal, setShowBulkDeleteModal] = useState(false);
+  const [deleteTyped, setDeleteTyped] = useState('');
+  const [deletePassword, setDeletePassword] = useState('');
+  const [bulkDeleting, setBulkDeleting] = useState(false);
+  const needsPassword = requiresPasswordReauth(currentUser);
+  // Deleting a customer (the database archives it): the row Delete button, the
+  // checkboxes and "Delete Selected" only show for accounts allowed to do it.
+  const { canDeleteCustomers } = useShopPermissions();
+
+  const filteredCustomers = useMemo(() => {
+    return customers.filter(c => 
+      c.name?.toLowerCase().includes(searchTerm.toLowerCase()) || 
+      c.phone?.includes(searchTerm) ||
+      c.email?.toLowerCase().includes(searchTerm.toLowerCase())
+    );
+  }, [customers, searchTerm]);
+
+  const handleDelete = async (id: string) => {
+    if (!canDeleteCustomers) {
+      toast.error(REASONS.deleteCustomers);
+      return;
+    }
+    const customer = customers.find(c => c.id === id);
+    if (customer && (customer.creditBalance || 0) > 0) {
+      toast.error('Cannot delete: Customer has an outstanding credit balance.');
+      return;
+    }
+    
+    if (!shopId) {
+      toast.error('Shop not loaded yet. Please wait and try again.');
+      return;
+    }
+
+    if (window.confirm('Are you sure you want to delete this customer?')) {
+      try {
+        const result = await deleteCustomersOnServer(shopId, [id]);
+        if (!result) {
+          toast('The delete was sent, but its result could not be checked. Refreshing the list.');
+          refetchCustomers();
+        } else if (result.notRemoved.length) {
+          toast.error('The customer was not deleted. Check the internet connection and try again.');
+        } else {
+          toast.success(result.archived ? `Archived ${customer?.name || 'the customer'}` : 'Customer deleted successfully');
+        }
+      } catch (error: any) {
+        console.error('Customer delete error:', error);
+        toast.error(isMassDeleteBlocked(error) ? MASS_DELETE_MESSAGE : friendlyError(error, 'The customer could not be deleted. Please try again.'));
+      }
+    }
+  };
+
+  const toggleSelectAll = (checked: boolean) => {
+    setSelectedIds(checked ? filteredCustomers.map((c) => c.id) : []);
+  };
+
+  const toggleSelectOne = (id: string, checked: boolean) => {
+    setSelectedIds((prev) => checked ? [...new Set([...prev, id])] : prev.filter((x) => x !== id));
+  };
+
+  const handleBulkDelete = async () => {
+    if (!selectedIds.length) return;
+    if (!canDeleteCustomers) {
+      toast.error(REASONS.deleteCustomers);
+      return;
+    }
+    
+    // Check if any selected customer has outstanding credit
+    const hasCredit = selectedIds.some(id => {
+      const c = customers.find(x => x.id === id);
+      return c && (c.creditBalance || 0) > 0;
+    });
+    
+    if (hasCredit) {
+      toast.error('Cannot delete: One or more selected customers have an outstanding credit balance.');
+      return;
+    }
+
+    if (!shopId) {
+      toast.error('Shop not loaded yet. Please wait and try again.');
+      return;
+    }
+    if (selectedIds.length > MAX_DELETE_AT_ONCE) {
+      toast.error(MASS_DELETE_MESSAGE);
+      return;
+    }
+    const ids = [...selectedIds];
+
+    setBulkDeleting(true);
+    try {
+      if (needsPassword && currentUser) {
+        await reauthenticateForSensitiveAction(currentUser, deletePassword);
+      }
+
+      const result = await deleteCustomersOnServer(shopId, ids);
+      if (!result) {
+        toast('The delete was sent, but its result could not be checked. Refreshing the list.');
+        refetchCustomers();
+        setSelectedIds([]);
+      } else {
+        const removed = new Set(result.removed);
+        setSelectedIds(prev => prev.filter(id => !removed.has(id)));
+        if (result.notRemoved.length) {
+          toast.error(`${result.removed.length} of ${ids.length} customer(s) ${result.archived ? 'archived' : 'deleted'}. The other ${result.notRemoved.length} were not deleted and stay selected.`);
+        } else {
+          toast.success(result.archived ? `Archived ${ids.length} customer(s)` : `Deleted ${ids.length} customer(s)`);
+        }
+      }
+      setShowBulkDeleteModal(false);
+      setDeleteTyped('');
+      setDeletePassword('');
+    } catch (error: any) {
+      console.error('Customer bulk delete error:', error);
+      toast.error(isMassDeleteBlocked(error) ? MASS_DELETE_MESSAGE : friendlyError(error, 'The selected customers could not be deleted. Please try again.'));
+    } finally {
+      setBulkDeleting(false);
+    }
+  };
+
+  if (loading) return <LoadingSpinner />;
+
+  return (
+    <div className="space-y-8 animate-in fade-in duration-500 pb-12">
+      <header className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+        <div className="flex items-center gap-4">
+          <div className="w-12 h-12 rounded-xl bg-violet-600 flex items-center justify-center text-white shadow-lg shadow-violet-600/20">
+            <Users size={24} />
+          </div>
+          <div>
+            <h1 className="text-2xl font-bold text-slate-900 tracking-tight">Credit / Customers</h1>
+            <p className="text-slate-500 text-sm">Manage your client relationships and credit balances</p>
+          </div>
+        </div>
+        <div className="flex items-center gap-3">
+          <button
+            onClick={() => {
+              setCreditCustomerId(undefined);
+              setShowAddCreditModal(true);
+            }}
+            className="flex items-center gap-2 px-6 py-3 bg-amber-500 hover:bg-amber-600 text-white font-bold rounded-xl transition-all shadow-lg shadow-amber-500/20 uppercase tracking-wider text-sm"
+          >
+            <CreditCard size={18} />
+            Add Credit
+          </button>
+          <button 
+            onClick={() => setShowAddModal(true)}
+            className="flex items-center gap-2 px-6 py-3 bg-violet-600 hover:bg-violet-700 text-white font-bold rounded-xl transition-all shadow-lg shadow-violet-600/20 uppercase tracking-wider text-sm"
+          >
+            <Plus size={20} />
+            Add Customer
+          </button>
+        </div>
+      </header>
+
+      {/* Stats Overview */}
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+        <div className="metric-card-cyan rounded-2xl p-6 shadow-lg shadow-cyan-500/20 relative overflow-hidden group">
+          <div className="absolute top-4 right-4 p-3 bg-white/20 rounded-xl group-hover:scale-110 transition-transform duration-300">
+            <Users size={24} className="text-white" />
+          </div>
+          <div className="relative z-10">
+            <p className="text-white/70 text-[10px] font-bold uppercase tracking-widest mb-1">Total Customers</p>
+            <p className="text-3xl font-bold text-white">{customers.length}</p>
+          </div>
+        </div>
+        <div className="metric-card-orange rounded-2xl p-6 shadow-lg shadow-orange-500/20 relative overflow-hidden group">
+          <div className="absolute top-4 right-4 p-3 bg-white/20 rounded-xl group-hover:scale-110 transition-transform duration-300">
+            <CreditCard size={24} className="text-white" />
+          </div>
+          <div className="relative z-10">
+            <p className="text-white/70 text-[10px] font-bold uppercase tracking-widest mb-1">Total Credit Outstanding</p>
+            <p className="text-3xl font-bold text-white">
+              {formatCurrency(customers.reduce((acc, c) => acc + (c.creditBalance || 0), 0))}
+            </p>
+          </div>
+        </div>
+        <div className="metric-card-emerald rounded-2xl p-6 shadow-lg shadow-emerald-500/20 relative overflow-hidden group">
+          <div className="absolute top-4 right-4 p-3 bg-white/20 rounded-xl group-hover:scale-110 transition-transform duration-300">
+            <UserPlus size={24} className="text-white" />
+          </div>
+          <div className="relative z-10">
+            <p className="text-white/70 text-[10px] font-bold uppercase tracking-widest mb-1">Active Customers (30d)</p>
+            <p className="text-3xl font-bold text-white">{customers.length}</p>
+          </div>
+        </div>
+      </div>
+
+      {/* Search */}
+      <div className="glass-card p-4 bg-slate-50/50 flex items-center justify-between gap-3">
+        <div className="relative max-w-md flex-1">
+          <Search className="absolute left-4 top-1/2 -translate-y-1/2 text-slate-400" size={18} />
+          <input 
+            type="text" 
+            placeholder="Search by name, phone, or email..."
+            value={searchTerm}
+            onChange={(e) => setSearchTerm(e.target.value)}
+            className="w-full pl-12 pr-4 py-2.5 bg-white border border-slate-200 rounded-xl text-slate-900 text-sm focus:outline-none focus:ring-2 focus:ring-violet-500/20 transition-all shadow-sm"
+          />
+        </div>
+        {!canDeleteCustomers && (
+          <span className="text-[11px] font-semibold text-slate-500">{REASONS.deleteCustomers}</span>
+        )}
+        {canDeleteCustomers && selectedIds.length > 0 && (
+          <div className="flex flex-col items-end gap-1">
+            <button
+              onClick={() => setShowBulkDeleteModal(true)}
+              disabled={selectedIds.length > MAX_DELETE_AT_ONCE}
+              title={selectedIds.length > MAX_DELETE_AT_ONCE ? REASONS.tooManyToDelete : undefined}
+              className="px-4 py-2.5 bg-rose-600 hover:bg-rose-700 text-white rounded-xl text-sm font-bold disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              Delete Selected ({selectedIds.length})
+            </button>
+            {selectedIds.length > MAX_DELETE_AT_ONCE && (
+              <span className="text-[11px] font-semibold text-rose-600">{REASONS.tooManyToDelete} Select fewer.</span>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* Customer Table */}
+      <div className="glass-card overflow-hidden">
+        <div className="overflow-x-auto">
+          <table className="w-full text-left border-collapse">
+            <thead>
+              <tr className="bg-slate-50/50 border-b border-slate-100">
+                <th className="px-6 py-4 text-[10px] font-bold text-slate-400 uppercase tracking-widest">Customer</th>
+                <th className="px-6 py-4 text-[10px] font-bold text-slate-400 uppercase tracking-widest">Contact</th>
+                <th className="px-6 py-4 text-[10px] font-bold text-slate-400 uppercase tracking-widest">Credit Balance</th>
+                <th className="px-6 py-4 text-[10px] font-bold text-slate-400 uppercase tracking-widest">Joined</th>
+                {canDeleteCustomers && (
+                  <th className="px-3 py-4 text-[10px] font-bold text-slate-400 uppercase tracking-widest text-right">
+                    <input
+                      type="checkbox"
+                      checked={filteredCustomers.length > 0 && selectedIds.length === filteredCustomers.length}
+                      onChange={(e) => toggleSelectAll(e.target.checked)}
+                    />
+                  </th>
+                )}
+                <th className="px-6 py-4 text-[10px] font-bold text-slate-400 uppercase tracking-widest text-right">Actions</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-100">
+              {filteredCustomers.map((customer) => (
+                <tr key={customer.id} className="hover:bg-slate-50/50 transition-colors group">
+                  <td className="px-6 py-4">
+                    <div className="flex items-center gap-3">
+                      <div className="w-10 h-10 rounded-full bg-violet-100 text-violet-600 flex items-center justify-center font-bold">
+                        {customer.name?.charAt(0).toUpperCase()}
+                      </div>
+                      <span className="text-slate-900 font-bold group-hover:text-violet-600 transition-colors">{customer.name}</span>
+                    </div>
+                  </td>
+                  <td className="px-6 py-4">
+                    <div className="space-y-1">
+                      <div className="flex items-center gap-2 text-sm text-slate-900 font-medium">
+                        <Phone size={12} className="text-slate-400" />
+                        {customer.phone}
+                      </div>
+                      {customer.email && (
+                        <div className="flex items-center gap-2 text-xs text-slate-400">
+                          <Mail size={10} />
+                          {customer.email}
+                        </div>
+                      )}
+                    </div>
+                  </td>
+                  <td className="px-6 py-4">
+                    <span className={cn(
+                      "font-bold text-sm px-3 py-1 rounded-full",
+                      (customer.creditBalance || 0) > 0 ? "bg-amber-100 text-amber-600" : "bg-emerald-100 text-emerald-600"
+                    )}>
+                      {formatCurrency(customer.creditBalance || 0)}
+                    </span>
+                  </td>
+                  <td className="px-6 py-4 text-sm text-slate-500 font-medium">
+                    {(toDisplayDate(customer.createdAt, customer.createdAtClient) || new Date()).toLocaleDateString()}
+                  </td>
+                  {canDeleteCustomers && (
+                    <td className="px-3 py-4 text-right">
+                      <input
+                        type="checkbox"
+                        checked={selectedIds.includes(customer.id)}
+                        onChange={(e) => toggleSelectOne(customer.id, e.target.checked)}
+                      />
+                    </td>
+                  )}
+                  <td className="px-6 py-4 text-right">
+                    <div className="flex items-center justify-end gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
+                      <button 
+                        onClick={() => setShowHistoryModal(customer)}
+                        className="p-2 text-slate-400 hover:text-cyan-600 hover:bg-cyan-50 rounded-lg transition-all"
+                        title="Credit History"
+                      >
+                        <History size={18} />
+                      </button>
+                      <button 
+                        onClick={() => {
+                          setCreditCustomerId(customer.id);
+                          setShowAddCreditModal(true);
+                        }}
+                        className="p-2 text-slate-400 hover:text-amber-600 hover:bg-amber-50 rounded-lg transition-all"
+                        title="Add Credit"
+                      >
+                        <CreditCard size={18} />
+                      </button>
+                      <button 
+                        onClick={() => setEditingCustomer(customer)}
+                        className="p-2 text-slate-400 hover:text-violet-600 hover:bg-violet-50 rounded-lg transition-all" 
+                        title="Edit"
+                      >
+                        <Edit2 size={18} />
+                      </button>
+                      {canDeleteCustomers && (
+                        <button 
+                          onClick={() => handleDelete(customer.id)}
+                          className="p-2 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded-lg transition-all" 
+                          title="Delete"
+                        >
+                          <Trash2 size={18} />
+                        </button>
+                      )}
+                    </div>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        {filteredCustomers.length === 0 && (
+          <div className="py-20 text-center">
+            <div className="w-20 h-20 bg-slate-50 rounded-full flex items-center justify-center mx-auto mb-4">
+              <Users className="text-slate-300" size={40} />
+            </div>
+            <p className="text-slate-400 font-medium">No customers found matching your search.</p>
+          </div>
+        )}
+      </div>
+
+      {/* Add/Edit Modal */}
+      {(showAddModal || editingCustomer) && (
+        <CustomerModal 
+          customer={editingCustomer} 
+          onClose={() => {
+            setShowAddModal(false);
+            setEditingCustomer(null);
+          }} 
+        />
+      )}
+      {showAddCreditModal && (
+        <AddCreditModal
+          customers={customers}
+          initialCustomerId={creditCustomerId}
+          onClose={() => {
+            setShowAddCreditModal(false);
+            setCreditCustomerId(undefined);
+          }}
+        />
+      )}
+      {showHistoryModal && (
+        <CustomerCreditHistoryModal
+          customerId={showHistoryModal.id}
+          customerName={showHistoryModal.name}
+          onClose={() => setShowHistoryModal(null)}
+        />
+      )}
+      <ConfirmBulkDeleteModal
+        open={canDeleteCustomers && showBulkDeleteModal}
+        count={selectedIds.length}
+        title="Delete selected customers?"
+        busy={bulkDeleting}
+        typedConfirm={deleteTyped}
+        onTypedConfirmChange={setDeleteTyped}
+        requirePassword={needsPassword}
+        password={deletePassword}
+        onPasswordChange={setDeletePassword}
+        onClose={() => {
+          if (bulkDeleting) return;
+          setShowBulkDeleteModal(false);
+          setDeleteTyped('');
+          setDeletePassword('');
+        }}
+        onConfirm={handleBulkDelete}
+      />
+    </div>
+  );
+};
+
+export default Customers;
