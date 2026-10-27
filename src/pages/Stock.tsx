@@ -1,4 +1,4 @@
-﻿import React, { useEffect, useState, useMemo } from 'react';
+import React, { useEffect, useState, useMemo } from 'react';
 import { 
   Package, 
   Plus, 
@@ -109,6 +109,7 @@ interface ParsedImportRow {
   category: 'device' | 'coil' | 'e-liquid';
   bottleSizeMl?: number | null;
   stock: number;
+  remainingMl?: number | null;
   isValid: boolean;
   reason?: string;
 }
@@ -384,6 +385,8 @@ const Stock: React.FC = () => {
         const stock = Math.max(0, toNumberSafe(readByAliases(row, ['stock', 'qty', 'quantity'])));
         const bottleSizeRaw = readByAliases(row, ['bottle size', 'bottlesize', 'ml', 'size ml', 'size']);
         const bottleSizeMl = category === 'e-liquid' ? parseBottleSizeMl(bottleSizeRaw, 0) : null;
+        const remainingMlRaw = readByAliases(row, ['remaining ml', 'remainingml', 'remaining_ml', 'remaining', 'rem ml']);
+        const remainingMl = category === 'e-liquid' ? Math.max(0, toNumberSafe(remainingMlRaw)) : null;
         // Only skip if name is actually empty after trim.
         const invalidGeneralELiquid = mode === 'general' && inferredCategory === 'e-liquid';
         const isValid = name.length > 0 && (!invalidGeneralELiquid) && (category !== 'e-liquid' || (bottleSizeMl || 0) > 0);
@@ -402,6 +405,7 @@ const Stock: React.FC = () => {
           category,
           bottleSizeMl,
           stock: Number.isFinite(stock) ? stock : 0,
+          remainingMl,
           isValid,
           reason: isValid
             ? undefined
@@ -458,7 +462,8 @@ const Stock: React.FC = () => {
         const isELiquid = row.category === 'e-liquid';
         const bottleSizeMl = parseBottleSizeMl(row.bottleSizeMl, 30);
         const bottleCount = Math.max(0, Math.floor(row.stock));
-        const stockQuantity = isELiquid ? bottleSizeMl * bottleCount : bottleCount;
+        const importedRemainingMl = isELiquid ? Math.max(0, Number(row.remainingMl) || 0) : 0;
+        const stockQuantity = isELiquid ? (bottleSizeMl * bottleCount + importedRemainingMl) : bottleCount;
 
         const existingProduct = products.find(
           (p) => p.name?.trim().toLowerCase() === row.name.trim().toLowerCase() && p.category === row.category
@@ -501,22 +506,55 @@ const Stock: React.FC = () => {
           touchedIds.push(existingProduct.id);
           if (isELiquid) eLiquidIds.push(existingProduct.id);
 
-          if (isELiquid && bottleCount > 0) {
-            const bottles = [];
-            for (let i = 0; i < bottleCount; i++) {
-              bottles.push({
-                id: crypto.randomUUID(),
-                productId: existingProduct.id,
-                shopId,
-                bottleSize: bottleSizeMl,
-                remainingMl: bottleSizeMl,
-                status: 'closed',
-                createdAt: timestampIso,
-                updatedAt: timestampIso
-              });
+          if (isELiquid) {
+            if (importedRemainingMl > 0) {
+              const { data: existingBottles } = await supabase
+                .from('bottles')
+                .select('*')
+                .eq('shopId', shopId)
+                .eq('productId', existingProduct.id)
+                .order('createdAt', { ascending: true });
+
+              const targetBottle = (existingBottles || []).find((b: any) => b.status === 'opened') || (existingBottles || [])[0];
+
+              if (targetBottle) {
+                const currentRemaining = Number(targetBottle.remainingMl) || 0;
+                await mustWrite(`Updating remaining ml for ${existingProduct.name}`, supabase.from('bottles').update({
+                  remainingMl: currentRemaining + importedRemainingMl,
+                  updatedAt: timestampIso
+                }).eq('id', targetBottle.id));
+              } else {
+                await mustWrite(`Adding opened bottle to ${existingProduct.name}`, supabase.from('bottles').insert({
+                  id: crypto.randomUUID(),
+                  productId: existingProduct.id,
+                  shopId,
+                  bottleSize: bottleSizeMl,
+                  remainingMl: importedRemainingMl,
+                  status: 'opened',
+                  openedDate: timestampIso,
+                  createdAt: timestampIso,
+                  updatedAt: timestampIso
+                }));
+              }
             }
-            if (bottles.length > 0) {
-              await mustWrite(`Adding bottles to ${existingProduct.name}`, supabase.from('bottles').insert(bottles));
+
+            if (bottleCount > 0) {
+              const bottles = [];
+              for (let i = 0; i < bottleCount; i++) {
+                bottles.push({
+                  id: crypto.randomUUID(),
+                  productId: existingProduct.id,
+                  shopId,
+                  bottleSize: bottleSizeMl,
+                  remainingMl: bottleSizeMl,
+                  status: 'closed',
+                  createdAt: timestampIso,
+                  updatedAt: timestampIso
+                });
+              }
+              if (bottles.length > 0) {
+                await mustWrite(`Adding bottles to ${existingProduct.name}`, supabase.from('bottles').insert(bottles));
+              }
             }
           }
           merged += 1;
@@ -544,7 +582,7 @@ const Stock: React.FC = () => {
           }));
           rowStage = 'saved';
 
-          if (isELiquid && bottleCount > 0) {
+          if (isELiquid) {
             const bottles = [];
             for (let i = 0; i < bottleCount; i++) {
               bottles.push({
@@ -554,6 +592,19 @@ const Stock: React.FC = () => {
                 bottleSize: bottleSizeMl,
                 remainingMl: bottleSizeMl,
                 status: 'closed',
+                createdAt: timestampIso,
+                updatedAt: timestampIso
+              });
+            }
+            if (importedRemainingMl > 0) {
+              bottles.push({
+                id: crypto.randomUUID(),
+                productId: newProductId,
+                shopId,
+                bottleSize: bottleSizeMl,
+                remainingMl: importedRemainingMl,
+                status: 'opened',
+                openedDate: timestampIso,
                 createdAt: timestampIso,
                 updatedAt: timestampIso
               });
@@ -922,7 +973,7 @@ const Stock: React.FC = () => {
                 <h2 className="text-xl font-bold text-slate-900">Bulk Import Preview</h2>
                 <p className="text-xs text-slate-500 mt-1">
                   File: {importFileName || 'N/A'} | {importMode === 'eliquid'
-                    ? 'E-Liquid mode: required columns Name, Price, Stock, BottleSize/ML (Category optional).'
+                    ? 'E-Liquid mode: columns Name, Price, Stock, Bottle Size, Remaining ML (Category optional).'
                     : 'Device/Coil mode: columns Name, Price, Category, Stock. E-liquid rows are skipped for safety.'} Selling price is auto set (+65%, Ã—{IMPORT_SELLING_MULTIPLIER}).
                 </p>
               </div>
@@ -978,6 +1029,7 @@ const Stock: React.FC = () => {
                       <th className="px-4 py-3 font-bold">Selling (Ã—1.65)</th>
                       <th className="px-4 py-3 font-bold">Category</th>
                       <th className="px-4 py-3 font-bold">Stock</th>
+                      {importMode === 'eliquid' && <th className="px-4 py-3 font-bold">Remaining ML</th>}
                       <th className="px-4 py-3 font-bold">Status</th>
                     </tr>
                   </thead>
@@ -990,6 +1042,9 @@ const Stock: React.FC = () => {
                         <td className="px-4 py-3 text-slate-700">{row.sellingPrice}</td>
                         <td className="px-4 py-3 text-slate-700">{row.category}</td>
                         <td className="px-4 py-3 text-slate-700">{row.stock}</td>
+                        {importMode === 'eliquid' && (
+                          <td className="px-4 py-3 text-slate-700">{row.remainingMl != null ? `${row.remainingMl}ml` : '-'}</td>
+                        )}
                         <td className="px-4 py-3">
                           <span className={cn(
                             "px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-widest",
