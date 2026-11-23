@@ -22,6 +22,7 @@ import DetailedReports from './pages/DetailedReports';
 import InventoryLogs from './pages/InventoryLogs';
 import Settings from './pages/Settings';
 import Transfers from './pages/Transfers';
+import GlobalAgentWidget from './components/ai/GlobalAgentWidget';
 
 const Layout: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   return (
@@ -34,6 +35,7 @@ const Layout: React.FC<{ children: React.ReactNode }> = ({ children }) => {
       </main>
       <ConnectivityBadge />
       <SyncEngine />
+      <GlobalAgentWidget />
     </div>
   );
 };
