@@ -9,6 +9,7 @@ import {
   UserRoleType,
 } from '../types/aiAgent';
 import { AGENT_TOOLS, executeAgentTool, ToolExecutionContext } from './agentTools';
+import { supabase } from './supabase';
 
 const AGENT_STORAGE_KEY = 'vapetrax_agent_config';
 const OLD_DEFAULT_OPENROUTER_KEY = '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';
@@ -484,7 +485,7 @@ async function runOpenRouterTurn(
   const pendingActions: PendingToolCall[] = [];
 
   for (let step = 0; step < 6; step++) {
-    let res: Response | null = null;
+    let data: any = null;
     let lastErrText = '';
 
     const tryModels = [activeModel, ...fallbackQueue.filter((m) => m !== activeModel)];
@@ -498,47 +499,78 @@ async function runOpenRouterTurn(
           : `Synthesizing next step (${step + 1})...`
       );
 
-      res = await fetchWithTimeout(
-        endpoint,
-        {
-          method: 'POST',
-          headers: {
-            Authorization: `Bearer ${config.apiKey.trim()}`,
-            'Content-Type': 'application/json',
-            'HTTP-Referer': 'https://vapetrax.local',
-            'X-Title': 'VapeTrax AI Agent',
-          },
-          body: JSON.stringify({
+      // 1. Primary: Secure Supabase Edge Function (Zero client-side API key exposure)
+      try {
+        const { data: edgeData, error: edgeError } = await supabase.functions.invoke('sheru-agent', {
+          body: {
             model: candidateModel,
             messages,
             tools,
             tool_choice: 'auto',
             temperature: 0.1,
             max_tokens: 1500,
-          }),
-        },
-        22000,
-        options?.signal
-      );
+          },
+        });
 
-      if (res.ok) {
-        activeModel = candidateModel;
-        break;
+        if (!edgeError && edgeData?.choices?.[0]?.message) {
+          data = edgeData;
+          activeModel = candidateModel;
+          break;
+        }
+
+        if (edgeError) {
+          lastErrText = edgeError.message || JSON.stringify(edgeError);
+        }
+      } catch (edgeEx: any) {
+        lastErrText = edgeEx?.message || 'Edge function error';
       }
 
-      lastErrText = await res.text();
-      // Auto-failover on upstream 429 rate-limit, 502/503/404 model unavailability
-      if (res.status === 429 || res.status === 502 || res.status === 503 || res.status === 404) {
-        continue;
+      // 2. Direct client fallback if user configured a manual API key in UI settings
+      const directKey = config.apiKey?.trim();
+      if (directKey && directKey.startsWith('sk-or-')) {
+        try {
+          const res = await fetchWithTimeout(
+            endpoint,
+            {
+              method: 'POST',
+              headers: {
+                Authorization: `Bearer ${directKey}`,
+                'Content-Type': 'application/json',
+                'HTTP-Referer': 'https://vapetrax.app',
+                'X-Title': 'VapeTrax AI Agent',
+              },
+              body: JSON.stringify({
+                model: candidateModel,
+                messages,
+                tools,
+                tool_choice: 'auto',
+                temperature: 0.1,
+                max_tokens: 1500,
+              }),
+            },
+            22000,
+            options?.signal
+          );
+
+          if (res.ok) {
+            data = await res.json();
+            activeModel = candidateModel;
+            break;
+          }
+
+          lastErrText = await res.text();
+          if (res.status === 429 || res.status === 502 || res.status === 503 || res.status === 404) {
+            continue;
+          }
+        } catch (fetchEx: any) {
+          lastErrText = fetchEx?.message || 'Direct OpenRouter fetch failed';
+        }
       }
-      throw new Error(`OpenRouter Agent Error (${res.status}): ${lastErrText}`);
     }
 
-    if (!res || !res.ok) {
-      throw new Error(`OpenRouter Agent Error (${res?.status ?? 500}): ${lastErrText}`);
+    if (!data) {
+      throw new Error(`OpenRouter Agent Error: ${lastErrText || 'Could not communicate with Sheru LLM API.'}`);
     }
-
-    const data = await res.json();
     const message = data.choices?.[0]?.message;
     if (!message) throw new Error('Empty response from OpenRouter.');
 
