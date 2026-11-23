@@ -816,7 +816,7 @@ export const GlobalAgentWidget: React.FC = () => {
       const wakeMsg: AgentChatMessage = {
         id: `asst-wake-${Date.now()}`,
         role: 'assistant',
-        text: 'Pehly Sheru bol phir btaon ga.',
+        text: 'Aray pehly tameez se "Sheru" bol phir jawab doon ga, dukan ka malik hoga apne ghar pe.',
         timestamp: Date.now(),
       };
       setMessages((prev) => [...prev, wakeMsg]);
@@ -1512,10 +1512,10 @@ export const GlobalAgentWidget: React.FC = () => {
                 <img src="/sheru_mascot.png" alt="Sheru" className="w-full h-full object-contain filter drop-shadow-md scale-110" />
               </div>
               <h3 className="font-bold text-gray-900 text-lg tracking-tight">
-                Sheru hoon — kya chahiye ab?
+                Sheru hoon — bolo ab kya rola hai?
               </h3>
               <p className="text-xs text-gray-500 mt-1 max-w-sm">
-                Message mein kahin bhi <strong className="text-indigo-700">&quot;Sheru&quot;</strong> bolna zaroori hai, warna jawab nahi milna. Mic daba ke bol ya neechay se utha le.
+                Message mein kahin bhi <strong className="text-indigo-700">&quot;Sheru&quot;</strong> bolna zaroori hai, warna munh nahi lagana maine. Mic daba ke bol ya neechay se utha le.
               </p>
 
               {/* Interactive Bento Feature Showcase */}
