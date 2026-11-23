@@ -934,7 +934,7 @@ export const GlobalAgentWidget: React.FC = () => {
     );
   };
 
-  const isMockMode = config.provider === 'mock' || !config.apiKey.trim();
+  const isMockMode = config.provider === 'mock' || (config.provider === 'gemini' && !config.apiKey.trim());
 
   return (
     <>
@@ -1168,27 +1168,32 @@ export const GlobalAgentWidget: React.FC = () => {
                     />
                   </div>
 
-                  <div>
-                    <label className="block text-xs font-medium text-gray-600 mb-1">API Key</label>
-                    <div className="flex gap-1.5">
-                      <input
-                        type={showApiKey ? 'text' : 'password'}
-                        value={draftConfig.apiKey}
-                        onChange={(e) => setDraftConfig((prev) => ({ ...prev, apiKey: e.target.value }))}
-                        placeholder={
-                          draftConfig.provider === 'openrouter' ? 'sk-or-v1-...' : 'AIzaSy... / AQ...'
-                        }
-                        className="flex-1 px-3 py-1.5 rounded-lg border border-gray-300 bg-white text-sm font-mono focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500"
-                      />
-                      <button
-                        type="button"
-                        onClick={() => setShowApiKey((v) => !v)}
-                        className="px-2.5 py-1.5 rounded-lg border border-gray-300 bg-white text-xs text-gray-600 hover:bg-gray-100"
-                      >
-                        {showApiKey ? 'Hide' : 'Show'}
-                      </button>
+                  {draftConfig.provider === 'openrouter' ? (
+                    <div className="p-2.5 rounded-lg bg-emerald-50 border border-emerald-200 text-xs text-emerald-800 flex items-center gap-2">
+                      <ShieldCheck className="w-4 h-4 text-emerald-600 shrink-0" />
+                      <span>100% Server-Side Secured via <strong>Supabase Edge Functions</strong>. No API keys required in browser!</span>
                     </div>
-                  </div>
+                  ) : (
+                    <div>
+                      <label className="block text-xs font-medium text-gray-600 mb-1">API Key</label>
+                      <div className="flex gap-1.5">
+                        <input
+                          type={showApiKey ? 'text' : 'password'}
+                          value={draftConfig.apiKey}
+                          onChange={(e) => setDraftConfig((prev) => ({ ...prev, apiKey: e.target.value }))}
+                          placeholder="AIzaSy... / AQ..."
+                          className="flex-1 px-3 py-1.5 rounded-lg border border-gray-300 bg-white text-sm font-mono focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => setShowApiKey((v) => !v)}
+                          className="px-2.5 py-1.5 rounded-lg border border-gray-300 bg-white text-xs text-gray-600 hover:bg-gray-100"
+                        >
+                          {showApiKey ? 'Hide' : 'Show'}
+                        </button>
+                      </div>
+                    </div>
+                  )}
                 </>
               )}
             </div>

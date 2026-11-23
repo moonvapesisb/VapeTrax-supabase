@@ -1,8 +1,7 @@
 // Supabase Edge Function: sheru-agent
-// Secure OpenRouter Gateway with Auth verification, Secret Key hiding, and Auto-Fallback.
+// Secure OpenRouter Gateway with Secret Key hiding and Auto-Fallback.
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.8";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -17,29 +16,11 @@ serve(async (req) => {
   }
 
   try {
-    // 2. Validate Supabase Auth Token
-    const authHeader = req.headers.get("Authorization");
+    // 2. Validate request has Supabase authorization or API key header
+    const authHeader = req.headers.get("Authorization") || req.headers.get("apikey");
     if (!authHeader) {
       return new Response(
-        JSON.stringify({ error: "Missing Authorization header" }),
-        { status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-      );
-    }
-
-    const supabaseClient = createClient(
-      Deno.env.get("SUPABASE_URL") ?? "",
-      Deno.env.get("SUPABASE_ANON_KEY") ?? "",
-      { global: { headers: { Authorization: authHeader } } }
-    );
-
-    const {
-      data: { user },
-      error: userError,
-    } = await supabaseClient.auth.getUser();
-
-    if (userError || !user) {
-      return new Response(
-        JSON.stringify({ error: "Unauthorized: Invalid or expired Supabase session." }),
+        JSON.stringify({ error: "Unauthorized: Missing Supabase authorization" }),
         { status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );
     }

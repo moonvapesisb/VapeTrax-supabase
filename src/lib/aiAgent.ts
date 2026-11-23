@@ -488,92 +488,43 @@ async function runOpenRouterTurn(
   const pendingActions: PendingToolCall[] = [];
 
   for (let step = 0; step < 6; step++) {
-    let data: any = null;
-    let lastErrText = '';
+    options?.onProgress?.(
+      step === 0 ? `Thinking via ${primaryModel.split('/').pop()}...` : `Synthesizing step ${step + 1}...`
+    );
 
-    const tryModels = [activeModel, ...fallbackQueue.filter((m) => m !== activeModel)];
-    for (let i = 0; i < tryModels.length; i++) {
-      const candidateModel = tryModels[i];
-      options?.onProgress?.(
-        i > 0
-          ? `Rate-limited — switching to ${candidateModel.split('/').pop()}...`
-          : step === 0
-          ? `Thinking via ${candidateModel.split('/').pop()}...`
-          : `Synthesizing next step (${step + 1})...`
-      );
+    // Call Secure Supabase Edge Function (Zero client-side API key exposure)
+    const { data: edgeData, error: edgeError } = await supabase.functions.invoke('sheru-agent', {
+      body: {
+        model: primaryModel,
+        messages,
+        tools,
+        tool_choice: 'auto',
+        temperature: 0.1,
+        max_tokens: 1500,
+      },
+    });
 
-      // 1. Primary: Secure Supabase Edge Function (Zero client-side API key exposure)
+    if (edgeError) {
+      let serverErr = edgeError.message || 'Edge function error';
       try {
-        const { data: edgeData, error: edgeError } = await supabase.functions.invoke('sheru-agent', {
-          body: {
-            model: candidateModel,
-            messages,
-            tools,
-            tool_choice: 'auto',
-            temperature: 0.1,
-            max_tokens: 1500,
-          },
-        });
-
-        if (!edgeError && edgeData?.choices?.[0]?.message) {
-          data = edgeData;
-          activeModel = candidateModel;
-          break;
+        if (typeof (edgeError as any).context?.json === 'function') {
+          const bodyJson = await (edgeError as any).context.json();
+          if (bodyJson?.error) serverErr = bodyJson.error;
         }
-
-        if (edgeError) {
-          lastErrText = edgeError.message || JSON.stringify(edgeError);
-        }
-      } catch (edgeEx: any) {
-        lastErrText = edgeEx?.message || 'Edge function error';
-      }
-
-      // 2. Direct client fallback if user configured a manual API key in UI settings
-      const directKey = config.apiKey?.trim();
-      if (directKey && directKey.startsWith('sk-or-')) {
-        try {
-          const res = await fetchWithTimeout(
-            endpoint,
-            {
-              method: 'POST',
-              headers: {
-                Authorization: `Bearer ${directKey}`,
-                'Content-Type': 'application/json',
-                'HTTP-Referer': 'https://vapetrax.app',
-                'X-Title': 'VapeTrax AI Agent',
-              },
-              body: JSON.stringify({
-                model: candidateModel,
-                messages,
-                tools,
-                tool_choice: 'auto',
-                temperature: 0.1,
-                max_tokens: 1500,
-              }),
-            },
-            22000,
-            options?.signal
-          );
-
-          if (res.ok) {
-            data = await res.json();
-            activeModel = candidateModel;
-            break;
-          }
-
-          lastErrText = await res.text();
-          if (res.status === 429 || res.status === 502 || res.status === 503 || res.status === 404) {
-            continue;
-          }
-        } catch (fetchEx: any) {
-          lastErrText = fetchEx?.message || 'Direct OpenRouter fetch failed';
-        }
-      }
+      } catch {}
+      throw new Error(`Sheru Server Error: ${serverErr}`);
     }
 
-    if (!data) {
-      throw new Error(`OpenRouter Agent Error: ${lastErrText || 'Could not communicate with Sheru LLM API.'}`);
+    if (!edgeData) {
+      throw new Error('Sheru Server Error: Empty response from edge function.');
     }
+
+    if (edgeData.error) {
+      const msg = typeof edgeData.error === 'string' ? edgeData.error : edgeData.error.message || JSON.stringify(edgeData.error);
+      throw new Error(`OpenRouter Error: ${msg}`);
+    }
+
+    const data = edgeData;
     const message = data.choices?.[0]?.message;
     if (!message) throw new Error('Empty response from OpenRouter.');
 
@@ -881,11 +832,15 @@ export async function runAgentTurn(
   ctx: ToolExecutionContext,
   options?: RunAgentOptions
 ): Promise<AgentTurnOutput> {
-  if (config.provider === 'mock' || !config.apiKey?.trim()) {
+  if (config.provider === 'mock') {
     return runMockTurn(userText, config, ctx, options);
   }
   if (config.provider === 'gemini') {
+    if (!config.apiKey?.trim()) {
+      return runMockTurn(userText, config, ctx, options);
+    }
     return runGeminiTurn(userText, history, config, ctx, options);
   }
+  // OpenRouter is 100% server-side via Supabase Edge Functions — NO frontend key required!
   return runOpenRouterTurn(userText, history, config, ctx, options);
 }
