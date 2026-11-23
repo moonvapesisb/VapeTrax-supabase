@@ -12,10 +12,13 @@ import { AGENT_TOOLS, executeAgentTool, ToolExecutionContext } from './agentTool
 import { supabase } from './supabase';
 
 const AGENT_STORAGE_KEY = 'vapetrax_agent_config';
-const OLD_DEFAULT_OPENROUTER_KEY = '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';
+const INVALID_OLD_KEYS = new Set([
+  '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',
+  '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',
+]);
 const OLD_DEFAULT_GEMINI_KEY = 'AQ.Ab8RN6JWCivtgj5vAKERCL21k3YN96nNvs26uFV93WG6MCCXnw';
 const DEPRECATED_GEMINI_MODELS = new Set(['gemini-1.5-flash', 'gemini-2.0-flash', 'gemini-2.5-flash', 'gemini-2.5-flash-lite']);
-const CURRENT_CONFIG_VERSION = 3;
+const CURRENT_CONFIG_VERSION = 4;
 
 export function normalizeGeminiModel(model?: string): string {
   const m = model?.trim();
@@ -54,7 +57,7 @@ export function getStoredAgentConfig(): AgentConfig {
             apiKey = DEFAULT_AGENT_MODELS.gemini.defaultKey || '';
           }
         } else if (provider === 'openrouter') {
-          if (!apiKey || apiKey === OLD_DEFAULT_OPENROUTER_KEY) {
+          if (!apiKey || INVALID_OLD_KEYS.has(apiKey)) {
             apiKey = DEFAULT_AGENT_MODELS.openrouter.defaultKey || '';
           }
           if (!model || model === 'openrouter/free') {

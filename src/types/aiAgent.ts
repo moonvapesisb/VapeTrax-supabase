@@ -14,7 +14,7 @@ export interface AgentConfig {
 
 export const DEFAULT_AGENT_MODELS: Record<AgentProvider, { label: string; defaultModel: string; defaultKey?: string }> = {
   openrouter: {
-    label: 'OpenRouter (Supabase Edge Function • Secure)',
+    label: 'OpenRouter (Auto-Fallback • Recommended)',
     defaultModel: 'openai/gpt-4o-mini',
     defaultKey: '',
   },
