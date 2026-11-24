@@ -9,6 +9,7 @@
     "preview": "vite preview",
     "clean": "rm -rf dist",
     "lint": "tsc --noEmit",
+    "telegram:setup": "node scripts/setup-telegram.mjs",
     "sql:check": "node supabase/rehearsal/check.mjs",
     "sql:rehearse": "node supabase/rehearsal/run.mjs",
     "build:clone-sql": "node scripts/build-clone-sql.mjs",
