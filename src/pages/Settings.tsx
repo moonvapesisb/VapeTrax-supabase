@@ -1,4 +1,5 @@
 ﻿import React, { useState, useEffect } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import { 
   Settings as SettingsIcon, 
   Store, 
@@ -25,7 +26,8 @@ import {
   Info,
   Download,
   AlertTriangle,
-  RefreshCw
+  RefreshCw,
+  Bot
 } from 'lucide-react';
 import { useSupabaseOnce, useDocumentOnce } from '../hooks/useSupabaseOnce';
 import { usePWA } from '../hooks/usePWA';
@@ -35,6 +37,7 @@ import toast from 'react-hot-toast';
 import { formatCurrency, cn } from '../lib/utils';
 import LoadingSpinner from '../components/ui/LoadingSpinner';
 import { BackupRestoreTab } from '../components/settings/BackupRestoreTab';
+import { SheruSettingsTab } from '../components/settings/SheruSettingsTab';
 
 const Settings: React.FC = () => {
   const { shopId, currentUser, createCashier, deleteCashier, resetPassword } = useAuth();
@@ -44,7 +47,18 @@ const Settings: React.FC = () => {
   const settingsLoadFailed = !!settingsError;
   const { document: adminUser } = useDocumentOnce<any>('profiles', currentUser?.uid || '___none___', 'id');
   const { canInstall, isStandalone, promptInstall } = usePWA();
-  const [activeTab, setActiveTab] = useState('shop');
+  const [searchParams, setSearchParams] = useSearchParams();
+  const [activeTab, setActiveTabState] = useState(() => searchParams.get('tab') || 'shop');
+  const setActiveTab = (tab: string) => {
+    setActiveTabState(tab);
+    setSearchParams(tab === 'shop' ? {} : { tab }, { replace: true });
+  };
+  useEffect(() => {
+    const tabParam = searchParams.get('tab');
+    if (tabParam && tabParam !== activeTab) {
+      setActiveTabState(tabParam);
+    }
+  }, [searchParams]);
   const [formData, setFormData] = useState<any>(null);
   const [adminForm, setAdminForm] = useState({ name: '', email: '' });
   const [adminSaving, setAdminSaving] = useState(false);
@@ -144,7 +158,7 @@ const Settings: React.FC = () => {
             <p className="text-slate-500 text-sm">Configure your shop details, branding, and system preferences</p>
           </div>
         </div>
-        {activeTab !== 'security' && (
+        {activeTab !== 'security' && activeTab !== 'sheru' && (
           <button
             onClick={handleSave}
             disabled={settingsLoadFailed}
@@ -213,6 +227,12 @@ const Settings: React.FC = () => {
             onClick={() => setActiveTab('mobile')} 
             icon={<Smartphone size={18} />} 
             label="Mobile App" 
+          />
+          <SettingsNavButton 
+            active={activeTab === 'sheru'} 
+            onClick={() => setActiveTab('sheru')} 
+            icon={<Bot size={18} />} 
+            label="Sheru AI" 
           />
           <SettingsNavButton 
             active={activeTab === 'backup'} 
@@ -534,6 +554,8 @@ const Settings: React.FC = () => {
               </div>
             </div>
           )}
+
+          {activeTab === 'sheru' && <SheruSettingsTab />}
 
           {activeTab === 'backup' && <BackupRestoreTab />}
         </div>

@@ -10,18 +10,14 @@ import {
   ChevronRight,
   CreditCard,
   ImagePlus,
-  KeyRound,
   Loader2,
   Lock,
   Maximize2,
-  MessageCircle,
   Mic,
   MicOff,
   Minimize2,
   Package,
-  QrCode,
   Receipt,
-  RefreshCw,
   Send,
   Settings,
   ShieldAlert,
@@ -29,7 +25,6 @@ import {
   Sparkles,
   Square,
   Trash2,
-  Unlink,
   User,
   Volume2,
   VolumeX,
@@ -47,49 +42,25 @@ import { getStoredAgentConfig, runAgentTurn, saveStoredAgentConfig } from '../..
 import {
   getStoredSheruVoiceSettings,
   saveStoredSheruVoiceSettings,
-  SHERU_VOICES,
   SheruVoiceSettings,
   speakAsSheru,
   stopSheruSpeech,
 } from '../../lib/sheruVoice';
 import {
   getStoredVoiceLock,
-  saveStoredVoiceLock,
   VoiceFrameCollector,
   VoiceLockConfig,
 } from '../../lib/voiceLock';
 import {
   AgentChatMessage,
   AgentConfig,
-  AgentProvider,
-  DEFAULT_AGENT_MODELS,
   PendingToolCall,
   UserRoleType,
 } from '../../types/aiAgent';
 import { AgentVisualCards } from './AgentVisualCards';
+import { SHERU_CONFIG_UPDATED_EVENT } from '../settings/SheruSettingsTab';
 
 const SHERU_WAKE_REGEX = /\b(?:sheru|sheroo|shero|shiru|shehru|shairu|shiro)\b/i;
-
-const API_BASE =
-  typeof window !== 'undefined' && window.location.origin.startsWith('http')
-    ? `${window.location.origin}/api`
-    : 'http://localhost:3847/api';
-
-interface WhatsAppBridgeState {
-  status: 'disconnected' | 'connecting' | 'qr' | 'connected' | 'error';
-  qrDataUrl: string | null;
-  connectedUser: { id: string; name: string; phone: string } | null;
-  lastError: string;
-  hasSavedAuth: boolean;
-  config: {
-    ownerNumbers: string;
-    allowSelfChat: boolean;
-    voiceReplies: boolean;
-    hasOpenRouterKey: boolean;
-    model: string;
-  };
-  logs: Array<{ id: string; time: string; kind: string; text: string }>;
-}
 
 function renderFormattedText(text: string): React.ReactNode {
   const lines = text.split('\n');
@@ -137,25 +108,12 @@ export const GlobalAgentWidget: React.FC = () => {
 
   const [isOpen, setIsOpen] = useState(false);
   const [isWide, setIsWide] = useState(false);
-  const [showSettings, setShowSettings] = useState(false);
-  const [showApiKey, setShowApiKey] = useState(false);
 
   const [config, setConfig] = useState<AgentConfig>(() => getStoredAgentConfig());
-  const [draftConfig, setDraftConfig] = useState<AgentConfig>(() => getStoredAgentConfig());
   const [voiceLock, setVoiceLock] = useState<VoiceLockConfig>(() => getStoredVoiceLock());
   const [voiceSettings, setVoiceSettings] = useState<SheruVoiceSettings>(() => getStoredSheruVoiceSettings());
   const voiceSettingsRef = useRef<SheruVoiceSettings>(voiceSettings);
   const [speakingMsgId, setSpeakingMsgId] = useState<string | null>(null);
-  const [isEnrollingVoice, setIsEnrollingVoice] = useState(false);
-  const [enrollCountdown, setEnrollCountdown] = useState(0);
-
-  // WhatsApp Linked-Device Bridge state
-  const [waState, setWaState] = useState<WhatsAppBridgeState | null>(null);
-  const [waOwnerNumbers, setWaOwnerNumbers] = useState('');
-  const [waAllowSelfChat, setWaAllowSelfChat] = useState(true);
-  const [waVoiceReplies, setWaVoiceReplies] = useState(false);
-  const [waBusy, setWaBusy] = useState(false);
-  const waConfigLoadedRef = useRef(false);
 
   const [messages, setMessages] = useState<AgentChatMessage[]>([]);
   const [input, setInput] = useState('');
@@ -261,6 +219,16 @@ export const GlobalAgentWidget: React.FC = () => {
     voiceSettingsRef.current = voiceSettings;
   }, [voiceSettings]);
 
+  useEffect(() => {
+    const syncConfig = () => {
+      setConfig(getStoredAgentConfig());
+      setVoiceSettings(getStoredSheruVoiceSettings());
+      setVoiceLock(getStoredVoiceLock());
+    };
+    window.addEventListener(SHERU_CONFIG_UPDATED_EVENT, syncConfig);
+    return () => window.removeEventListener(SHERU_CONFIG_UPDATED_EVENT, syncConfig);
+  }, []);
+
   const triggerSpeak = (msgId: string, text: string, force = false) => {
     const activeSettings = voiceSettingsRef.current;
     if (!force && !activeSettings.autoSpeak) return;
@@ -335,170 +303,13 @@ export const GlobalAgentWidget: React.FC = () => {
   const handleToggleAutopilot = () => {
     const next: AgentConfig = { ...config, autopilot: !config.autopilot };
     setConfig(next);
-    setDraftConfig(next);
     saveStoredAgentConfig(next);
+    window.dispatchEvent(new CustomEvent(SHERU_CONFIG_UPDATED_EVENT));
     toast.success(
       next.autopilot
         ? 'Autopilot ON: Sheru executes writes automatically'
         : 'Confirm Mode ON: Sheru asks before saving changes'
     );
-  };
-
-  const handleProviderChange = (provider: AgentProvider) => {
-    setDraftConfig((prev) => {
-      let nextKey = prev.apiKey;
-      if (provider === 'gemini' && (!nextKey || nextKey.startsWith('sk-or-'))) {
-        nextKey = DEFAULT_AGENT_MODELS.gemini.defaultKey || '';
-      } else if (provider === 'openrouter' && (!nextKey || nextKey.startsWith('AQ.'))) {
-        nextKey = DEFAULT_AGENT_MODELS.openrouter.defaultKey || '';
-      }
-      return {
-        ...prev,
-        provider,
-        model: DEFAULT_AGENT_MODELS[provider].defaultModel,
-        apiKey: nextKey,
-      };
-    });
-  };
-
-  const handleSaveSettings = () => {
-    const cleaned: AgentConfig = {
-      ...draftConfig,
-      apiKey: draftConfig.apiKey.trim(),
-      model: draftConfig.model.trim() || DEFAULT_AGENT_MODELS[draftConfig.provider].defaultModel,
-      configVersion: 3,
-    };
-    setConfig(cleaned);
-    setDraftConfig(cleaned);
-    saveStoredAgentConfig(cleaned);
-    fetch(`${API_BASE}/whatsapp/config`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        ownerNumbers: waOwnerNumbers,
-        allowSelfChat: waAllowSelfChat,
-        voiceReplies: waVoiceReplies,
-        ...(cleaned.provider === 'openrouter' && cleaned.apiKey
-          ? { openRouterApiKey: cleaned.apiKey, model: cleaned.model }
-          : {}),
-      }),
-    }).catch(() => {});
-    setShowSettings(false);
-    toast.success('Sheru settings saved');
-  };
-
-  const refreshWaStatus = async () => {
-    try {
-      const res = await fetch(`${API_BASE}/whatsapp/status`);
-      if (!res.ok) return;
-      const data: WhatsAppBridgeState = await res.json();
-      setWaState(data);
-      if (!waConfigLoadedRef.current && data.config) {
-        setWaOwnerNumbers(data.config.ownerNumbers || '');
-        setWaAllowSelfChat(Boolean(data.config.allowSelfChat));
-        setWaVoiceReplies(Boolean(data.config.voiceReplies));
-        waConfigLoadedRef.current = true;
-      }
-    } catch {
-      // backend might still be restarting
-    }
-  };
-
-  useEffect(() => {
-    if (!showSettings) return;
-    refreshWaStatus();
-    const timer = setInterval(() => {
-      refreshWaStatus();
-    }, 2500);
-    return () => clearInterval(timer);
-  }, [showSettings]);
-
-  const handleSaveWaConfig = async (quiet = false) => {
-    try {
-      const activeKey =
-        draftConfig.provider === 'openrouter' && draftConfig.apiKey.trim()
-          ? draftConfig.apiKey.trim()
-          : config.provider === 'openrouter'
-            ? config.apiKey.trim()
-            : '';
-      const activeModel =
-        draftConfig.provider === 'openrouter' && draftConfig.model.trim()
-          ? draftConfig.model.trim()
-          : config.model;
-      const res = await fetch(`${API_BASE}/whatsapp/config`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          ownerNumbers: waOwnerNumbers,
-          allowSelfChat: waAllowSelfChat,
-          voiceReplies: waVoiceReplies,
-          ...(activeKey ? { openRouterApiKey: activeKey, model: activeModel } : {}),
-        }),
-      });
-      if (res.ok) {
-        const data: WhatsAppBridgeState = await res.json();
-        setWaState(data);
-        if (!quiet) toast.success('WhatsApp bridge config saved');
-      }
-    } catch {
-      if (!quiet) toast.error('Could not reach local backend for WhatsApp config');
-    }
-  };
-
-  const handleConnectWhatsApp = async () => {
-    setWaBusy(true);
-    try {
-      const activeKey =
-        draftConfig.provider === 'openrouter' && draftConfig.apiKey.trim()
-          ? draftConfig.apiKey.trim()
-          : config.provider === 'openrouter'
-            ? config.apiKey.trim()
-            : '';
-      const activeModel =
-        draftConfig.provider === 'openrouter' && draftConfig.model.trim()
-          ? draftConfig.model.trim()
-          : config.model;
-      const res = await fetch(`${API_BASE}/whatsapp/connect`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          ownerNumbers: waOwnerNumbers,
-          allowSelfChat: waAllowSelfChat,
-          voiceReplies: waVoiceReplies,
-          ...(activeKey ? { openRouterApiKey: activeKey, model: activeModel } : {}),
-        }),
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        toast.error(data.error || 'Failed to start WhatsApp bridge');
-      } else {
-        setWaState(data);
-      }
-    } catch {
-      toast.error('Local API server offline — make sure server/index.js is running');
-    } finally {
-      setWaBusy(false);
-    }
-  };
-
-  const handleDisconnectWhatsApp = async (logout: boolean) => {
-    setWaBusy(true);
-    try {
-      const res = await fetch(`${API_BASE}/whatsapp/disconnect`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ logout }),
-      });
-      const data = await res.json();
-      if (res.ok) {
-        setWaState(data);
-        toast.success(logout ? 'WhatsApp unlinked' : 'WhatsApp disconnected');
-      }
-    } catch {
-      toast.error('Failed to disconnect WhatsApp');
-    } finally {
-      setWaBusy(false);
-    }
   };
 
   const cleanupAudioMonitor = () => {
@@ -535,66 +346,6 @@ export const GlobalAgentWidget: React.FC = () => {
       recognitionRef.current = null;
     }
     cleanupAudioMonitor();
-  };
-
-  const handleEnrollVoice = async () => {
-    if (isEnrollingVoice) return;
-    if (!navigator.mediaDevices?.getUserMedia) {
-      toast.error('Microphone access not supported in this browser.');
-      return;
-    }
-    if (isListeningRef.current) stopVoiceRecognition();
-
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
-      const ctx = new AudioCtx();
-      const source = ctx.createMediaStreamSource(stream);
-      const analyser = ctx.createAnalyser();
-      analyser.fftSize = 2048;
-      source.connect(analyser);
-
-      const collector = new VoiceFrameCollector();
-      setIsEnrollingVoice(true);
-      setEnrollCountdown(3);
-      toast('Speak clearly for 3 seconds: "Hey Sheru, verify my voice"', { icon: '🎙️', duration: 3500 });
-
-      const sampler = setInterval(() => {
-        collector.pushFrame(analyser, ctx.sampleRate);
-      }, 50);
-
-      let left = 3;
-      const timer = setInterval(() => {
-        left -= 1;
-        setEnrollCountdown(Math.max(0, left));
-      }, 1000);
-
-      setTimeout(() => {
-        clearInterval(sampler);
-        clearInterval(timer);
-        stream.getTracks().forEach((t) => t.stop());
-        ctx.close().catch(() => {});
-        setIsEnrollingVoice(false);
-        setEnrollCountdown(0);
-
-        const profile = collector.buildProfile();
-        if (!profile) {
-          toast.error('Did not hear enough voice! Speak louder for 3 seconds and try again.');
-          return;
-        }
-        const next: VoiceLockConfig = {
-          ...voiceLock,
-          enabled: true,
-          profile,
-        };
-        setVoiceLock(next);
-        saveStoredVoiceLock(next);
-        toast.success(`Voiceprint enrolled! (~${profile.avgPitchHz} Hz baseline)`);
-      }, 3300);
-    } catch (err: any) {
-      setIsEnrollingVoice(false);
-      toast.error(err?.message || 'Microphone permission denied.');
-    }
   };
 
   const handleToggleVoice = async () => {
@@ -1024,9 +775,7 @@ export const GlobalAgentWidget: React.FC = () => {
               </div>
               <p className="text-[11px] text-slate-300 truncate flex items-center gap-1.5 mt-0.5">
                 <span className={`w-1.5 h-1.5 rounded-full ${isMockMode ? 'bg-amber-400' : 'bg-emerald-400'}`} />
-                {isMockMode
-                  ? 'Offline Simulator (0 API Hits)'
-                  : `${config.provider.toUpperCase()} • ${config.model.split('/').pop()}`}
+                {isMockMode ? 'Offline Simulator' : 'Online • Supabase Edge AI'}
               </p>
             </div>
           </div>
@@ -1057,6 +806,7 @@ export const GlobalAgentWidget: React.FC = () => {
                 const next = { ...voiceSettings, autoSpeak: !voiceSettings.autoSpeak };
                 setVoiceSettings(next);
                 saveStoredSheruVoiceSettings(next);
+                window.dispatchEvent(new CustomEvent(SHERU_CONFIG_UPDATED_EVENT));
                 if (!next.autoSpeak) {
                   stopSheruSpeech();
                   setSpeakingMsgId(null);
@@ -1084,19 +834,19 @@ export const GlobalAgentWidget: React.FC = () => {
               {isWide ? <Minimize2 className="w-4 h-4" /> : <Maximize2 className="w-4 h-4" />}
             </button>
 
-            <button
-              type="button"
-              onClick={() => {
-                setDraftConfig(config);
-                setShowSettings((prev) => !prev);
-              }}
-              title="Sheru Engine & Voice Lock Settings"
-              className={`p-1.5 rounded-lg transition-colors ${
-                showSettings ? 'bg-indigo-500 text-white' : 'text-slate-300 hover:bg-white/10 hover:text-white'
-              }`}
-            >
-              <Settings className="w-4 h-4" />
-            </button>
+            {normalizedRole === 'admin' && (
+              <button
+                type="button"
+                onClick={() => {
+                  setIsOpen(false);
+                  navigate('/settings?tab=sheru');
+                }}
+                title="Open Sheru Settings"
+                className="p-1.5 rounded-lg text-slate-300 hover:bg-white/10 hover:text-white transition-colors"
+              >
+                <Settings className="w-4 h-4" />
+              </button>
+            )}
 
             {messages.length > 0 && (
               <button
@@ -1123,391 +873,6 @@ export const GlobalAgentWidget: React.FC = () => {
             </button>
           </div>
         </div>
-
-        {/* Settings Drawer (LLM + Voice Lock) */}
-        {showSettings && (
-          <div className="p-4 bg-slate-50 border-b border-gray-200 space-y-3.5 text-sm max-h-[70vh] overflow-y-auto">
-            <div className="flex items-center justify-between">
-              <span className="font-semibold text-gray-800 flex items-center gap-1.5">
-                <KeyRound className="w-4 h-4 text-indigo-600" />
-                Sheru Engine & Security Settings
-              </span>
-              <button
-                type="button"
-                onClick={() => setShowSettings(false)}
-                className="text-xs text-gray-500 hover:text-gray-700"
-              >
-                Close
-              </button>
-            </div>
-
-            <div className="grid grid-cols-1 gap-2.5">
-              <div>
-                <label className="block text-xs font-medium text-gray-600 mb-1">AI Provider</label>
-                <select
-                  value={draftConfig.provider}
-                  onChange={(e) => handleProviderChange(e.target.value as AgentProvider)}
-                  className="w-full px-3 py-1.5 rounded-lg border border-gray-300 bg-white text-sm focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500"
-                >
-                  <option value="openrouter">{DEFAULT_AGENT_MODELS.openrouter.label}</option>
-                  <option value="gemini">{DEFAULT_AGENT_MODELS.gemini.label}</option>
-                  <option value="mock">{DEFAULT_AGENT_MODELS.mock.label}</option>
-                </select>
-              </div>
-
-              {draftConfig.provider !== 'mock' && (
-                <>
-                  <div>
-                    <label className="block text-xs font-medium text-gray-600 mb-1">Model ID</label>
-                    <input
-                      type="text"
-                      value={draftConfig.model}
-                      onChange={(e) => setDraftConfig((prev) => ({ ...prev, model: e.target.value }))}
-                      placeholder={DEFAULT_AGENT_MODELS[draftConfig.provider].defaultModel}
-                      className="w-full px-3 py-1.5 rounded-lg border border-gray-300 bg-white text-sm font-mono focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500"
-                    />
-                  </div>
-
-                  {draftConfig.provider === 'openrouter' ? (
-                    <div className="p-2.5 rounded-lg bg-emerald-50 border border-emerald-200 text-xs text-emerald-800 flex items-center gap-2">
-                      <ShieldCheck className="w-4 h-4 text-emerald-600 shrink-0" />
-                      <span>100% Server-Side Secured via <strong>Supabase Edge Functions</strong>. No API keys required in browser!</span>
-                    </div>
-                  ) : (
-                    <div>
-                      <label className="block text-xs font-medium text-gray-600 mb-1">API Key</label>
-                      <div className="flex gap-1.5">
-                        <input
-                          type={showApiKey ? 'text' : 'password'}
-                          value={draftConfig.apiKey}
-                          onChange={(e) => setDraftConfig((prev) => ({ ...prev, apiKey: e.target.value }))}
-                          placeholder="AIzaSy... / AQ..."
-                          className="flex-1 px-3 py-1.5 rounded-lg border border-gray-300 bg-white text-sm font-mono focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500"
-                        />
-                        <button
-                          type="button"
-                          onClick={() => setShowApiKey((v) => !v)}
-                          className="px-2.5 py-1.5 rounded-lg border border-gray-300 bg-white text-xs text-gray-600 hover:bg-gray-100"
-                        >
-                          {showApiKey ? 'Hide' : 'Show'}
-                        </button>
-                      </div>
-                    </div>
-                  )}
-                </>
-              )}
-            </div>
-
-            {/* Sheru Voice Lock Section */}
-            <div className="pt-3 border-t border-gray-200 space-y-2">
-              <div className="flex items-center justify-between">
-                <span className="text-xs font-bold text-gray-800 flex items-center gap-1.5">
-                  <Lock className="w-3.5 h-3.5 text-indigo-600" />
-                  Sheru Voice Lock (Single-Speaker Filter)
-                </span>
-                {voiceLock.profile && (
-                  <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-700">
-                    Enrolled • ~{voiceLock.profile.avgPitchHz}Hz
-                  </span>
-                )}
-              </div>
-
-              <div className="flex flex-wrap items-center gap-2">
-                <button
-                  type="button"
-                  disabled={isEnrollingVoice}
-                  onClick={handleEnrollVoice}
-                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-indigo-50 text-indigo-700 border border-indigo-200 text-xs font-semibold hover:bg-indigo-100 disabled:opacity-60"
-                >
-                  <Volume2 className="w-3.5 h-3.5" />
-                  {isEnrollingVoice
-                    ? `Speak now (${enrollCountdown}s)...`
-                    : voiceLock.profile
-                    ? 'Re-enroll My Voice (3s)'
-                    : 'Enroll My Voice (3s)'}
-                </button>
-
-                {voiceLock.profile && (
-                  <>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        const next = { ...voiceLock, enabled: !voiceLock.enabled };
-                        setVoiceLock(next);
-                        saveStoredVoiceLock(next);
-                      }}
-                      className={`px-2.5 py-1.5 rounded-lg text-xs font-semibold border ${
-                        voiceLock.enabled
-                          ? 'bg-emerald-600 text-white border-emerald-600'
-                          : 'bg-white text-gray-600 border-gray-300'
-                      }`}
-                    >
-                      Lock: {voiceLock.enabled ? 'ON' : 'OFF'}
-                    </button>
-
-                    <button
-                      type="button"
-                      onClick={() => {
-                        const next: VoiceLockConfig = {
-                          ...voiceLock,
-                          strictness: voiceLock.strictness === 'strict' ? 'normal' : 'strict',
-                        };
-                        setVoiceLock(next);
-                        saveStoredVoiceLock(next);
-                      }}
-                      className="px-2.5 py-1.5 rounded-lg text-xs font-medium border border-gray-300 bg-white text-gray-700"
-                    >
-                      Mode: {voiceLock.strictness === 'strict' ? 'Strict' : 'Normal'}
-                    </button>
-
-                    <button
-                      type="button"
-                      onClick={() => {
-                        const cleared: VoiceLockConfig = { enabled: false, strictness: 'normal', profile: null };
-                        setVoiceLock(cleared);
-                        saveStoredVoiceLock(cleared);
-                        toast('Voiceprint cleared');
-                      }}
-                      className="text-xs text-red-600 hover:underline px-1"
-                    >
-                      Clear
-                    </button>
-                  </>
-                )}
-              </div>
-
-              <p className="text-[11px] text-gray-500 leading-snug">
-                Checks pitch & vocal spectrum locally before hitting the API (0 MB model overhead). Best for blocking distinctly different voices.
-              </p>
-            </div>
-
-            {/* Sheru Talk-Back Voice Section */}
-            <div className="p-3 rounded-xl border border-indigo-200 bg-white space-y-2">
-              <div className="flex items-center justify-between">
-                <span className="text-xs font-bold text-gray-800 flex items-center gap-1.5">
-                  <Volume2 className="w-3.5 h-3.5 text-indigo-600" />
-                  Sheru Voice (Talk Back)
-                </span>
-                <button
-                  type="button"
-                  onClick={() =>
-                    triggerSpeak(
-                      'voice-test',
-                      'Aray bhai, Sheru bol raha hoon. Kaam bata, sone de warna.',
-                      true
-                    )
-                  }
-                  className="text-[11px] font-semibold text-indigo-600 hover:underline"
-                >
-                  {speakingMsgId === 'voice-test' ? 'Stop Test' : 'Test Voice'}
-                </button>
-              </div>
-              <select
-                value={voiceSettings.voice}
-                onChange={(e) => {
-                  const next = { ...voiceSettings, voice: e.target.value };
-                  setVoiceSettings(next);
-                  saveStoredSheruVoiceSettings(next);
-                }}
-                className="w-full px-2.5 py-1.5 rounded-lg border border-gray-300 bg-white text-xs text-gray-800 focus:ring-2 focus:ring-indigo-500"
-              >
-                {SHERU_VOICES.map((v) => (
-                  <option key={v.id} value={v.id}>
-                    {v.label} — {v.hint}
-                  </option>
-                ))}
-              </select>
-              <p className="text-[11px] text-gray-500 leading-snug">
-                Uses free Edge Neural voices via local server when online, and auto-falls back to browser speech offline (0 API credits).
-              </p>
-            </div>
-
-            {/* WhatsApp QR Linked-Device Bridge Section */}
-            <div className="p-3 rounded-xl border border-emerald-200 bg-white space-y-2.5">
-              <div className="flex items-center justify-between gap-2">
-                <span className="text-xs font-bold text-gray-800 flex items-center gap-1.5">
-                  <MessageCircle className="w-3.5 h-3.5 text-emerald-600" />
-                  WhatsApp QR Bridge (Free Local Bot)
-                </span>
-                <span
-                  className={`px-2 py-0.5 rounded-full text-[10px] font-bold uppercase ${
-                    waState?.status === 'connected'
-                      ? 'bg-emerald-100 text-emerald-700'
-                      : waState?.status === 'qr' || waState?.status === 'connecting'
-                        ? 'bg-amber-100 text-amber-700'
-                        : waState?.status === 'error'
-                          ? 'bg-red-100 text-red-700'
-                          : 'bg-gray-100 text-gray-600'
-                  }`}
-                >
-                  {waState?.status || 'disconnected'}
-                </span>
-              </div>
-
-              {waState?.status === 'connected' && waState.connectedUser && (
-                <div className="flex items-center justify-between gap-2 px-2.5 py-2 rounded-lg bg-emerald-50 border border-emerald-200 text-xs text-emerald-900">
-                  <div>
-                    <p className="font-semibold">
-                      Linked: {waState.connectedUser.name}
-                    </p>
-                    <p className="text-[11px] text-emerald-700 font-mono">
-                      +{waState.connectedUser.phone || waState.connectedUser.id}
-                    </p>
-                  </div>
-                  <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
-                </div>
-              )}
-
-              {waState?.status === 'qr' && waState.qrDataUrl && (
-                <div className="flex flex-col items-center gap-2 p-2.5 rounded-lg bg-slate-50 border border-slate-200">
-                  <img
-                    src={waState.qrDataUrl}
-                    alt="WhatsApp Link QR Code"
-                    className="w-44 h-44 rounded-lg border border-white shadow-sm"
-                  />
-                  <p className="text-[11px] text-center text-gray-600 leading-snug">
-                    WhatsApp → <strong>Linked Devices</strong> → <strong>Link a Device</strong> → scan this QR.
-                  </p>
-                </div>
-              )}
-
-              {waState?.lastError && waState.status !== 'connected' && (
-                <p className="text-[11px] text-red-600 bg-red-50 border border-red-200 rounded-lg px-2 py-1">
-                  {waState.lastError}
-                </p>
-              )}
-
-              <div>
-                <label className="block text-[11px] font-semibold text-gray-600 mb-1">
-                  Allowed Owner Number(s) (Anti-Ban Whitelist)
-                </label>
-                <input
-                  type="text"
-                  value={waOwnerNumbers}
-                  onChange={(e) => setWaOwnerNumbers(e.target.value)}
-                  onBlur={() => handleSaveWaConfig(true)}
-                  placeholder="03001234567, 03219876543"
-                  className="w-full px-2.5 py-1.5 rounded-lg border border-gray-300 text-xs focus:ring-2 focus:ring-emerald-500"
-                />
-                <p className="text-[10px] text-gray-500 mt-0.5">
-                  Sheru ONLY replies to these numbers (+ self-chat if enabled). Strangers/groups are ignored silently.
-                </p>
-              </div>
-
-              <div className="flex flex-wrap items-center gap-3 text-[11px] text-gray-700">
-                <label className="flex items-center gap-1.5 cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={waAllowSelfChat}
-                    onChange={(e) => setWaAllowSelfChat(e.target.checked)}
-                    className="rounded border-gray-300 text-emerald-600 focus:ring-emerald-500"
-                  />
-                  Allow Self-Chat ("Message Yourself")
-                </label>
-                <label className="flex items-center gap-1.5 cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={waVoiceReplies}
-                    onChange={(e) => setWaVoiceReplies(e.target.checked)}
-                    className="rounded border-gray-300 text-emerald-600 focus:ring-emerald-500"
-                  />
-                  Voice Note Reply (MP3)
-                </label>
-              </div>
-
-              <div className="flex flex-wrap items-center gap-1.5">
-                {waState?.status !== 'connected' ? (
-                  <button
-                    type="button"
-                    disabled={waBusy}
-                    onClick={handleConnectWhatsApp}
-                    className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-emerald-600 text-white text-xs font-semibold hover:bg-emerald-700 disabled:opacity-50"
-                  >
-                    <QrCode className="w-3.5 h-3.5" />
-                    {waState?.status === 'qr' ? 'QR Active' : 'Connect & Show QR'}
-                  </button>
-                ) : (
-                  <button
-                    type="button"
-                    disabled={waBusy}
-                    onClick={() => handleDisconnectWhatsApp(false)}
-                    className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-slate-700 text-white text-xs font-semibold hover:bg-slate-800 disabled:opacity-50"
-                  >
-                    Disconnect
-                  </button>
-                )}
-
-                <button
-                  type="button"
-                  disabled={waBusy}
-                  onClick={() => handleDisconnectWhatsApp(true)}
-                  className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-red-200 bg-red-50 text-red-700 text-xs font-semibold hover:bg-red-100 disabled:opacity-50"
-                >
-                  <Unlink className="w-3 h-3" />
-                  Unlink
-                </button>
-
-                <button
-                  type="button"
-                  disabled={waBusy}
-                  onClick={() => {
-                    handleSaveWaConfig(false);
-                    refreshWaStatus();
-                  }}
-                  className="inline-flex items-center gap-1 px-2 py-1.5 rounded-lg border border-gray-300 text-gray-700 text-xs font-medium hover:bg-gray-100"
-                >
-                  <RefreshCw className="w-3 h-3" />
-                  Save & Sync
-                </button>
-              </div>
-
-              {waState?.logs && waState.logs.length > 0 && (
-                <div className="max-h-24 overflow-y-auto rounded-lg bg-slate-900 text-slate-200 p-2 space-y-0.5 text-[10px] font-mono">
-                  {waState.logs.slice(0, 6).map((log) => (
-                    <div key={log.id} className="truncate">
-                      <span className="text-slate-400">[{log.time}]</span>{' '}
-                      <span
-                        className={
-                          log.kind === 'error'
-                            ? 'text-red-400'
-                            : log.kind === 'in'
-                              ? 'text-sky-300'
-                              : log.kind === 'out'
-                                ? 'text-emerald-300'
-                                : 'text-amber-300'
-                        }
-                      >
-                        {log.kind.toUpperCase()}
-                      </span>{' '}
-                      {log.text}
-                    </div>
-                  ))}
-                </div>
-              )}
-
-              <p className="text-[10px] text-amber-800 bg-amber-50 border border-amber-200 rounded-lg px-2 py-1 leading-snug">
-                ⚠️ Unofficial Linked-Device protocol: prefer a <strong>spare SIM</strong>, never send bulk/cold messages, and keep Owner Whitelist enabled.
-              </p>
-            </div>
-
-            <div className="flex justify-end gap-2 pt-1">
-              <button
-                type="button"
-                onClick={() => setShowSettings(false)}
-                className="px-3 py-1.5 rounded-lg border border-gray-300 text-xs font-medium text-gray-700 hover:bg-gray-100"
-              >
-                Cancel
-              </button>
-              <button
-                type="button"
-                onClick={handleSaveSettings}
-                className="px-3 py-1.5 rounded-lg bg-indigo-600 text-white text-xs font-medium hover:bg-indigo-700"
-              >
-                Save Settings
-              </button>
-            </div>
-          </div>
-        )}
 
         {/* Messages Thread */}
         <div className="flex-1 overflow-y-auto p-4 space-y-4 bg-gradient-to-b from-slate-50 to-slate-100/80">
