@@ -152,9 +152,12 @@ ok('personal_expenses: the admin adds, edits and deletes (a copy is kept)',
   && (await one(`select count(*)::int n from private.deleted_rows where "table" = 'personal_expenses' and "rowId" = 'pe2'`)).n === 1);
 await expectError('personal_expenses: a cashier cannot add one', () => as(C,
   `insert into public.personal_expenses (id, "shopId", amount) values ('pe3', $1, 1)`, [A]), /row-level security/);
-for (const t of ['finance_accounts', 'finance_transactions', 'daily_summaries', 'stock_alerts']) {
+for (const t of ['daily_summaries', 'stock_alerts']) {
   ok(`${t}: deny-all (the admin sees nothing)`, (await as(A, `select * from public.${t}`)).rows.length === 0);
   await expectError(`${t}: deny-all (the admin cannot add)`, () => as(A, `insert into public.${t} (id, "shopId") values ('z', $1)`, [A]), /row-level security/);
+}
+for (const t of ['finance_accounts', 'finance_transactions']) {
+  await expectError(`${t}: direct app insert blocked`, () => as(A, `insert into public.${t} (id, "shopId") values ('z', $1)`, [A]), /permission denied|row-level security/);
 }
 
 // ---------------------------------------------------------------------

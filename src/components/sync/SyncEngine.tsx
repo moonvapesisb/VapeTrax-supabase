@@ -1,8 +1,25 @@
 import { useEffect, useState, useCallback } from 'react';
 import { useLiveQuery } from 'dexie-react-hooks';
 import { db, SyncOperation } from '../../lib/db';
+import type { Database, Json } from '../../types/supabase';
 import { supabase } from '../../lib/supabase';
-import { refreshRowsOf } from '../../lib/sync';
+import { refreshRowsOf, syncFinanceFromCloud } from '../../lib/sync';
+import {
+  reapplyOptimisticLocalOp,
+  revertOptimisticLocalOp,
+} from '../../lib/financeAccounts';
+import {
+  createdTxIdsOf,
+  isBlockedByDependency,
+  isQueueItemDue as isDue,
+  referencedAccountIds,
+  sendableNow,
+  TRANSIENT_CODES,
+  TRANSIENT_HTTP,
+  waitsForNetwork,
+} from '../../lib/financeCore';
+export { referencedAccountIds, sendableNow, waitsForNetwork };
+import { notifyTableChanged } from '../../lib/liveSync';
 import { useAuth } from '../../contexts/AuthContext';
 import { CloudOff, RefreshCw, AlertTriangle, Trash2, Download, RotateCcw, X } from 'lucide-react';
 import toast from 'react-hot-toast';
@@ -45,15 +62,6 @@ const TAB_ID = typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'fu
 const backoffMs = (attempts: number, cap = MAX_BACKOFF_MS) =>
   Math.min(cap, 5_000 * 2 ** Math.min(Math.max(attempts, 1) - 1, 6));
 
-// Answers that mean "try again later", not "this item is wrong".
-const TRANSIENT_HTTP = new Set([0, 408, 425, 429, 502, 503, 504, 520, 521, 522, 523, 524]);
-const TRANSIENT_CODES = new Set([
-  '40001', '40P01', // serialization failure, deadlock
-  '55P03', '57014', // lock or statement timeout
-  '53300', '57P01', '57P03', // too many connections, server restarting
-  'PGRST301', 'PGRST303', // expired login; it refreshes by itself
-]);
-
 type Outcome =
   | { kind: 'done' }
   | { kind: 'unreached'; message: string; code: string } // never reached the server, or it was busy: not counted
@@ -63,38 +71,18 @@ type Outcome =
 const timeoutSignal = (ms: number): AbortSignal | undefined =>
   typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function' ? AbortSignal.timeout(ms) : undefined;
 
-const errorText = (err: any): string =>
-  err?.message || err?.details || (err ? JSON.stringify(err) : '') || 'Unknown error';
-
-const asArray = (v: unknown): any[] => (Array.isArray(v) ? v : []);
-
-const isDue = (item: SyncOperation, now: number) => !item.nextAttemptAt || item.nextAttemptAt <= now;
-
-/** Is this item waiting for the network (or a busy server), rather than refused? */
-export const waitsForNetwork = (item: SyncOperation): boolean => {
-  if (item.lastOutcome) return item.lastOutcome === 'unreached';
-  // Items from before lastOutcome existed: tell by the stored code.
-  const code = item.lastErrorCode || '';
-  if (!code) return false;
-  if (code === 'network') return true;
-  const http = /^http_(\d+)$/.exec(code);
-  if (http) return TRANSIENT_HTTP.has(Number(http[1]));
-  return TRANSIENT_CODES.has(code);
-};
-
-/**
- * Which of these pending items (oldest first) may be sent now. Stops at the first one
- * that is waiting for the network; passes over ones the server refused that are not
- * due yet.
- */
-export const sendableNow = (pending: SyncOperation[], now: number): SyncOperation[] => {
-  const out: SyncOperation[] = [];
-  for (const item of pending) {
-    if (isDue(item, now)) out.push(item);
-    else if (waitsForNetwork(item)) break;
+const errorText = (err: unknown): string => {
+  if (typeof err === 'object' && err !== null) {
+    const rec = err as Record<string, unknown>;
+    if (typeof rec.message === 'string' && rec.message) return rec.message;
+    if (typeof rec.details === 'string' && rec.details) return rec.details;
+    return JSON.stringify(err) || 'Unknown error';
   }
-  return out;
+  return typeof err === 'string' && err ? err : 'Unknown error';
 };
+
+const asArray = (v: unknown): Record<string, unknown>[] =>
+  Array.isArray(v) ? (v as Record<string, unknown>[]) : [];
 
 /** Bottle ids whose levels this item sets on the server. */
 const bottleIdsOf = (item: SyncOperation): string[] =>
@@ -104,12 +92,14 @@ const bottleIdsOf = (item: SyncOperation): string[] =>
     .map(String);
 
 /** The payload to send: bottles a later, already-sent sale has overtaken are left out. */
-export const payloadToSend = (item: SyncOperation): any => {
+export const payloadToSend = (item: SyncOperation): Record<string, unknown> => {
   const skip = new Set(item.overtakenBottleIds || []);
   if (!skip.size || !Array.isArray(item.payload?.p_bottle_updates)) return item.payload;
   return {
     ...item.payload,
-    p_bottle_updates: item.payload.p_bottle_updates.filter((b: any) => !skip.has(String(b?.id))),
+    p_bottle_updates: asArray(item.payload.p_bottle_updates).filter(
+      (b) => !skip.has(String(b?.id)),
+    ),
   };
 };
 
@@ -141,50 +131,237 @@ const saleIsOnServer = async (shopId: string | undefined, saleId: string): Promi
   return !!data;
 };
 
+/** Checks whether this deterministic-id item already reached the server. */
+const rowExistsOnServer = async (
+  table: 'finance_accounts' | 'finance_transactions' | 'expenses' | 'credits',
+  id: string,
+  shopId?: string,
+): Promise<boolean | null> => {
+  let query = supabase.from(table).select('id').eq('id', id);
+  if (shopId && table !== 'finance_accounts' && table !== 'finance_transactions') {
+    query = query.eq('shopId', shopId);
+  }
+  const signal = timeoutSignal(15_000);
+  if (signal) query = query.abortSignal(signal);
+  const { data, error } = await query.maybeSingle();
+  if (error) return null;
+  return !!data;
+};
+
+const itemIsAlreadyOnServer = async (item: SyncOperation): Promise<boolean | null> => {
+  const p = item.payload || {};
+  const shopId = p.p_shop_id ? String(p.p_shop_id) : undefined;
+  switch (item.type) {
+    case 'process_checkout': {
+      const saleId = (p.p_sale_data as { id?: unknown } | undefined)?.id;
+      return saleId ? saleIsOnServer(shopId, String(saleId)) : null;
+    }
+    case 'create_finance_account':
+      return p.p_id ? rowExistsOnServer('finance_accounts', String(p.p_id)) : null;
+    case 'record_opening_balance':
+    case 'record_payout':
+    case 'reverse_finance_transaction':
+      return p.p_id ? rowExistsOnServer('finance_transactions', String(p.p_id)) : null;
+    case 'transfer_funds':
+      return p.p_out_tx_id ? rowExistsOnServer('finance_transactions', String(p.p_out_tx_id)) : null;
+    case 'record_expense':
+      return p.p_expense_id ? rowExistsOnServer('expenses', String(p.p_expense_id), shopId) : null;
+    case 'record_credit_payment':
+      return p.p_credit_id ? rowExistsOnServer('credits', String(p.p_credit_id), shopId) : null;
+    default:
+      return null;
+  }
+};
+
+const SAFE_DUPLICATE_PK_RE =
+  /\b(sales_pkey|finance_accounts_pkey|finance_transactions_pkey|expenses_pkey|credits_pkey|finance_transactions_transfer_leg_unique)\b/;
+
+/** Calls the typed RPC matching `item.type`, returning the Supabase response or null if unsupported. */
+const executeItemRpc = (item: SyncOperation) => {
+  const p = item.payload || {};
+  const str = (v: unknown, fallback = ''): string => (v == null ? fallback : String(v));
+  const optStr = (v: unknown): string | null => (v == null ? null : String(v));
+  const numVal = (v: unknown, fallback = 0): number => {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : fallback;
+  };
+  const rpcArgs = () => {
+    switch (item.type) {
+      case 'process_checkout': {
+        const sent = payloadToSend(item);
+        const args: Database['public']['Functions']['process_checkout']['Args'] = {
+          p_bottle_updates: (sent.p_bottle_updates ?? []) as Json,
+          p_credit_increment: numVal(sent.p_credit_increment, 0),
+          p_customer_id: str(sent.p_customer_id),
+          p_inventory_logs: (sent.p_inventory_logs ?? []) as Json,
+          p_product_updates: (sent.p_product_updates ?? []) as Json,
+          p_sale_data: (sent.p_sale_data ?? {}) as Json,
+          p_shop_id: str(sent.p_shop_id),
+        };
+        return supabase.rpc('process_checkout', args);
+      }
+      case 'process_stock_adjustment': {
+        const sent = payloadToSend(item);
+        const args: Database['public']['Functions']['process_stock_adjustment']['Args'] = {
+          p_bottle_inserts: (sent.p_bottle_inserts ?? []) as Json,
+          p_bottle_updates: (sent.p_bottle_updates ?? []) as Json,
+          p_inventory_logs: (sent.p_inventory_logs ?? []) as Json,
+          p_product_id: str(sent.p_product_id),
+          p_product_update: (sent.p_product_update ?? {}) as Json,
+          p_shop_id: str(sent.p_shop_id),
+        };
+        return supabase.rpc('process_stock_adjustment', args);
+      }
+      case 'create_finance_account':
+        return supabase.rpc('create_finance_account', {
+          p_id: str(p.p_id),
+          p_shop_id: str(p.p_shop_id),
+          p_name: str(p.p_name),
+          p_type: str(p.p_type),
+          p_bank_name: optStr(p.p_bank_name),
+          p_account_number: optStr(p.p_account_number),
+          p_opening_balance: numVal(p.p_opening_balance, 0),
+          p_opening_tx_id: optStr(p.p_opening_tx_id),
+        });
+      case 'update_finance_account':
+        return supabase.rpc('update_finance_account', {
+          p_id: str(p.p_id),
+          p_name: str(p.p_name),
+          p_bank_name: optStr(p.p_bank_name),
+          p_account_number: optStr(p.p_account_number),
+        });
+      case 'archive_finance_account':
+        return supabase.rpc('archive_finance_account', {
+          p_id: str(p.p_id),
+        });
+      case 'record_opening_balance':
+        return supabase.rpc('record_opening_balance', {
+          p_id: str(p.p_id),
+          p_shop_id: str(p.p_shop_id),
+          p_account_id: str(p.p_account_id),
+          p_amount: numVal(p.p_amount),
+          p_notes: optStr(p.p_notes),
+          p_occurred_at: optStr(p.p_occurred_at),
+        });
+      case 'transfer_funds':
+        return supabase.rpc('transfer_funds', {
+          p_transfer_id: str(p.p_transfer_id),
+          p_out_tx_id: str(p.p_out_tx_id),
+          p_in_tx_id: str(p.p_in_tx_id),
+          p_shop_id: str(p.p_shop_id),
+          p_from_account_id: str(p.p_from_account_id),
+          p_to_account_id: str(p.p_to_account_id),
+          p_amount: numVal(p.p_amount),
+          p_description: optStr(p.p_description),
+          p_notes: optStr(p.p_notes),
+          p_occurred_at: optStr(p.p_occurred_at),
+        });
+      case 'record_payout':
+        return supabase.rpc('record_payout', {
+          p_id: str(p.p_id),
+          p_shop_id: str(p.p_shop_id),
+          p_account_id: str(p.p_account_id),
+          p_amount: numVal(p.p_amount),
+          p_paid_to: str(p.p_paid_to),
+          p_category: str(p.p_category),
+          p_description: optStr(p.p_description),
+          p_notes: optStr(p.p_notes),
+          p_occurred_at: optStr(p.p_occurred_at),
+        });
+      case 'record_expense':
+        return supabase.rpc('record_expense', {
+          p_expense_id: str(p.p_expense_id),
+          p_tx_id: str(p.p_tx_id),
+          p_shop_id: str(p.p_shop_id),
+          p_category: str(p.p_category),
+          p_description: str(p.p_description),
+          p_amount: numVal(p.p_amount),
+          p_expense_date: str(p.p_expense_date),
+          p_account_id: str(p.p_account_id),
+        });
+      case 'update_expense':
+        return supabase.rpc('update_expense', {
+          p_expense_id: str(p.p_expense_id),
+          p_shop_id: str(p.p_shop_id),
+          p_category: str(p.p_category),
+          p_description: str(p.p_description),
+          p_amount: numVal(p.p_amount),
+          p_expense_date: str(p.p_expense_date),
+          p_account_id: optStr(p.p_account_id),
+          p_rev_tx_id: optStr(p.p_rev_tx_id),
+          p_new_tx_id: optStr(p.p_new_tx_id),
+        });
+      case 'delete_expense':
+        return supabase.rpc('delete_expense', {
+          p_expense_id: str(p.p_expense_id),
+          p_shop_id: str(p.p_shop_id),
+          p_rev_tx_id: optStr(p.p_rev_tx_id),
+        });
+      case 'record_credit_payment':
+        return supabase.rpc('record_credit_payment', {
+          p_credit_id: str(p.p_credit_id),
+          p_tx_id: str(p.p_tx_id),
+          p_shop_id: str(p.p_shop_id),
+          p_customer_id: str(p.p_customer_id),
+          p_amount: numVal(p.p_amount),
+          p_payment_method: str(p.p_payment_method, 'cash'),
+          p_description: optStr(p.p_description),
+        });
+      case 'reverse_finance_transaction':
+        return supabase.rpc('reverse_finance_transaction', {
+          p_id: str(p.p_id),
+          p_shop_id: str(p.p_shop_id),
+          p_original_tx_id: str(p.p_original_tx_id),
+          p_reason: str(p.p_reason),
+          p_occurred_at: optStr(p.p_occurred_at),
+        });
+      default:
+        return null;
+    }
+  };
+
+  let call = rpcArgs();
+  if (!call) return null;
+  const signal = timeoutSignal(RPC_TIMEOUT_MS);
+  if (signal) call = call.abortSignal(signal);
+  return call;
+};
+
 /** Sends one queue item and says how it went. Never throws. */
 const sendItem = async (item: SyncOperation): Promise<Outcome> => {
-  if (item.type !== 'process_checkout' && item.type !== 'process_stock_adjustment') {
-    return { kind: 'unsupported', message: `This app version cannot send "${item.type}" items.`, code: 'unsupported' };
-  }
-
   try {
-    const saleId: string | undefined = item.type === 'process_checkout' ? item.payload?.p_sale_data?.id : undefined;
-    const shopId: string | undefined = item.payload?.p_shop_id;
-
     // An earlier attempt may have reached the server even though its answer was lost.
-    // If the sale is already there, the item is done and is not sent again.
-    if (saleId && (item.retryCount > 0 || (item.attempts || 0) > 0)) {
-      if (await saleIsOnServer(shopId, saleId)) return { kind: 'done' };
+    if (item.retryCount > 0 || (item.attempts || 0) > 0) {
+      if ((await itemIsAlreadyOnServer(item)) === true) return { kind: 'done' };
     }
 
-    const payload = payloadToSend(item);
-    let call = item.type === 'process_checkout'
-      ? supabase.rpc('process_checkout', payload)
-      : supabase.rpc('process_stock_adjustment', payload);
-    const signal = timeoutSignal(RPC_TIMEOUT_MS);
-    if (signal) call = call.abortSignal(signal);
+    const call = executeItemRpc(item);
+    if (!call) {
+      return { kind: 'unsupported', message: `This app version cannot send "${item.type}" items.`, code: 'unsupported' };
+    }
     const res = await call;
 
-    // Before migration 20261012100000 the RPCs return nothing; after it they return
-    // {status: 'applied' | 'duplicate', ...}. A duplicate means the server already has it.
     if (!res.error) return { kind: 'done' };
 
-    const err: any = res.error;
+    const err = res.error as { code?: unknown; message?: unknown; details?: unknown; constraint?: unknown };
     const status = Number(res.status) || 0;
     const message = errorText(err);
     const code = String(err.code || (status ? `http_${status}` : 'network'));
 
-    if (err.code === '23505') {
-      // Unique violation: the same sale was stored by an earlier attempt.
-      if (/sales_pkey/.test(`${err.message || ''} ${err.details || ''}`)) return { kind: 'done' };
-      if (saleId && (await saleIsOnServer(shopId, saleId))) return { kind: 'done' };
+    if (String(err.code || '') === '23505') {
+      // Only primary key / deterministic transfer-leg conflicts (or confirmed exact ID
+      // already on server) are treated as idempotent done; business uniqueness violations
+      // (e.g. single_ref_unique, duplicate cash/primary account) are genuine refusals.
+      const constraintDetail = `${String(err.message || '')} ${String(err.details || '')} ${String(err.constraint || '')}`;
+      if (SAFE_DUPLICATE_PK_RE.test(constraintDetail)) return { kind: 'done' };
+      if ((await itemIsAlreadyOnServer(item)) === true) return { kind: 'done' };
     }
 
     if (TRANSIENT_HTTP.has(status) || TRANSIENT_CODES.has(String(err.code || ''))) {
       return { kind: 'unreached', message, code };
     }
     return { kind: 'refused', message, code };
-  } catch (err: any) {
+  } catch (err: unknown) {
     return { kind: 'unreached', message: errorText(err), code: 'network' };
   }
 };
@@ -209,8 +386,23 @@ const writeLease = () => {
  * Runs fn only if no other tab is syncing right now; otherwise does nothing.
  * fn gets a renew() to call before each slow step (it keeps the fallback lease alive).
  */
+interface NavigatorWithLocks {
+  locks?: {
+    request: (
+      name: string,
+      options: { ifAvailable: boolean },
+      callback: (lock: unknown) => Promise<void>,
+    ) => Promise<void>;
+  };
+}
+
+interface DexieTxLike {
+  parent?: DexieTxLike;
+  on?: (event: string, listener: () => void) => void;
+}
+
 const withSyncLock = async (fn: (renew: () => void) => Promise<void>): Promise<boolean> => {
-  const locks: any = typeof navigator !== 'undefined' ? (navigator as any).locks : undefined;
+  const locks = typeof navigator !== 'undefined' ? (navigator as unknown as NavigatorWithLocks).locks : undefined;
   if (locks && typeof locks.request === 'function') {
     let ran = false;
     await locks.request(LOCK_NAME, { ifAvailable: true }, async (lock: unknown) => {
@@ -251,7 +443,7 @@ let kickQueue: (() => void) | null = null;
 // liveQuery: it fires once per new item, not on every change to the queue.)
 db.syncQueue.hook('creating', (_key, _obj, transaction) => {
   const kick = () => { setTimeout(() => kickQueue?.(), 0); };
-  let root: any = transaction;
+  let root: DexieTxLike | undefined = transaction as unknown as DexieTxLike;
   while (root?.parent) root = root.parent;
   if (root?.on && typeof root.on === 'function') root.on('complete', kick);
   else setTimeout(() => kickQueue?.(), 500);
@@ -270,15 +462,57 @@ const downloadJson = (items: SyncOperation[], label: string) => {
 };
 
 const describeItem = (item: SyncOperation): string => {
-  if (item.type === 'process_checkout') {
-    const sale = item.payload?.p_sale_data || {};
-    const amount = Number(sale.totalAmount);
-    const id = String(sale.id || '').slice(-6).toUpperCase();
-    return `Sale #${id}${Number.isFinite(amount) ? ` · Rs ${Math.round(amount).toLocaleString()}` : ''}`;
+  const p = item.payload || {};
+  switch (item.type) {
+    case 'process_checkout': {
+      const sale = (p.p_sale_data as Record<string, unknown> | undefined) || {};
+      const amount = Number(sale.totalAmount);
+      const id = String(sale.id || '').slice(-6).toUpperCase();
+      return `Sale #${id}${Number.isFinite(amount) ? ` · Rs ${Math.round(amount).toLocaleString()}` : ''}`;
+    }
+    case 'process_stock_adjustment':
+      return 'Stock adjustment';
+    case 'create_finance_account':
+      return `New bank account · ${String(p.p_name || 'Bank')}`;
+    case 'update_finance_account':
+      return `Edit account · ${String(p.p_name || 'Account')}`;
+    case 'archive_finance_account':
+      return 'Archive bank account';
+    case 'record_opening_balance':
+      return `Opening balance · Rs ${Math.round(Number(p.p_amount) || 0).toLocaleString()}`;
+    case 'transfer_funds':
+      return `Transfer · Rs ${Math.round(Number(p.p_amount) || 0).toLocaleString()}`;
+    case 'record_payout':
+      return `Payout to ${String(p.p_paid_to || 'recipient')} · Rs ${Math.round(Number(p.p_amount) || 0).toLocaleString()}`;
+    case 'record_expense':
+      return `Expense · Rs ${Math.round(Number(p.p_amount) || 0).toLocaleString()}`;
+    case 'update_expense':
+      return `Edit expense · Rs ${Math.round(Number(p.p_amount) || 0).toLocaleString()}`;
+    case 'delete_expense':
+      return 'Delete expense';
+    case 'record_credit_payment':
+      return `Credit payment · Rs ${Math.round(Number(p.p_amount) || 0).toLocaleString()}`;
+    case 'reverse_finance_transaction':
+      return 'Finance adjustment';
+    default:
+      return item.type;
   }
-  if (item.type === 'process_stock_adjustment') return 'Stock adjustment';
-  return item.type;
 };
+
+const FINANCE_SYNC_TYPES = new Set<SyncOperation['type']>([
+  'process_checkout',
+  'create_finance_account',
+  'update_finance_account',
+  'archive_finance_account',
+  'record_opening_balance',
+  'transfer_funds',
+  'record_payout',
+  'record_expense',
+  'update_expense',
+  'delete_expense',
+  'record_credit_payment',
+  'reverse_finance_transaction',
+]);
 
 const formatWhen = (iso: string): string => {
   const d = new Date(iso);
@@ -288,21 +522,46 @@ const formatWhen = (iso: string): string => {
 /** Re-reads, from the server, the device rows these items changed (grouped by shop). */
 const refreshSent = (items: SyncOperation[]) => {
   const byShop = new Map<string, SyncOperation[]>();
+  let touchedExpenses = false;
+  let touchedCredits = false;
   for (const item of items) {
-    const shopId = item.payload?.p_shop_id;
+    const shopId = item.payload?.p_shop_id ? String(item.payload.p_shop_id) : '';
+    if (item.type === 'record_expense' || item.type === 'update_expense' || item.type === 'delete_expense') {
+      touchedExpenses = true;
+    }
+    if (item.type === 'record_credit_payment') {
+      touchedCredits = true;
+    }
     if (!shopId) continue;
     byShop.set(shopId, [...(byShop.get(shopId) || []), item]);
   }
   for (const [shopId, group] of byShop) {
     refreshRowsOf(shopId, group).catch(err => console.warn('[SyncEngine] Refresh after sync failed', err));
+    if (group.some(op => FINANCE_SYNC_TYPES.has(op.type))) {
+      syncFinanceFromCloud(shopId).catch(err => console.warn('[SyncEngine] Finance refresh after sync failed', err));
+    }
   }
+  if (touchedExpenses) notifyTableChanged('expenses');
+  if (touchedCredits) notifyTableChanged('credits');
 };
 
 /** Sends the queue, oldest first (see the note at the top). Runs under the sync lock. */
 export const sendQueue = async (renew: () => void, setSyncing: (on: boolean) => void): Promise<void> => {
-  // Every pending item, oldest first (ids grow in the order sales were saved).
-  const pending = await db.syncQueue.where('status').equals('pending').sortBy('id');
-  if (!sendableNow(pending, Date.now()).length) return;
+  // Every pending item, oldest first (ids grow in the order actions were saved).
+  const allQueue = await db.syncQueue.orderBy('id').toArray();
+  const pending = allQueue.filter((item) => item.status === 'pending');
+  if (!sendableNow(pending, Date.now(), allQueue).length) return;
+
+  const blockedAccounts = new Set<string>();
+  const blockedTxs = new Set<string>();
+  for (const op of allQueue) {
+    if (op.status === 'failed') {
+      if (op.type === 'create_finance_account' && op.payload?.p_id) {
+        blockedAccounts.add(String(op.payload.p_id));
+      }
+      for (const txId of createdTxIdsOf(op)) blockedTxs.add(txId);
+    }
+  }
 
   const sent: SyncOperation[] = [];
   setSyncing(true);
@@ -314,8 +573,20 @@ export const sendQueue = async (renew: () => void, setSyncing: (on: boolean) => 
       const item = await db.syncQueue.get(queued.id!);
       if (!item || item.status !== 'pending') continue;
       if (!isDue(item, Date.now())) {
+        if (item.type === 'create_finance_account' && item.payload?.p_id) {
+          blockedAccounts.add(String(item.payload.p_id));
+        }
+        for (const txId of createdTxIdsOf(item)) blockedTxs.add(txId);
         if (waitsForNetwork(item)) break; // later items wait their turn
         continue; // refused earlier and resting: later items go ahead
+      }
+
+      if (isBlockedByDependency(item, blockedAccounts, blockedTxs)) {
+        if (item.type === 'create_finance_account' && item.payload?.p_id) {
+          blockedAccounts.add(String(item.payload.p_id));
+        }
+        for (const txId of createdTxIdsOf(item)) blockedTxs.add(txId);
+        continue; // must wait until the earlier create_finance_account / tx lands
       }
 
       renew();
@@ -325,6 +596,11 @@ export const sendQueue = async (renew: () => void, setSyncing: (on: boolean) => 
         sent.push(item);
         continue;
       }
+
+      if (item.type === 'create_finance_account' && item.payload?.p_id) {
+        blockedAccounts.add(String(item.payload.p_id));
+      }
+      for (const txId of createdTxIdsOf(item)) blockedTxs.add(txId);
 
       const attempts = (item.attempts || 0) + 1;
       console.error(`[SyncEngine] Item ${item.id} (${item.type}) not synced: ${outcome.code} ${outcome.message}`);
@@ -361,7 +637,8 @@ export const sendQueue = async (renew: () => void, setSyncing: (on: boolean) => 
       });
 
       if (nowFailed) {
-        toast.error(`${describeItem(item)} could not be saved to the cloud. Open the sync panel to export or retry it.`, { duration: 10000 });
+        await revertOptimisticLocalOp(item);
+        toast.error(`${describeItem(item)} could not be saved to the cloud. Local ledger changes were reverted; open the sync panel to export or retry it.`, { duration: 10000 });
       } else if (retryCount === 1) {
         toast.error(`${describeItem(item)} is not in the cloud yet: ${itemProblem(item.type, outcome.code, outcome.message)} It stays safe on this device and is tried again.`, { duration: 8000 });
       }
@@ -400,8 +677,9 @@ export function SyncEngine() {
     rerunRequested = false;
     try {
       // Cheap local check first, so idle ticks don't touch the lock.
-      const pending = await db.syncQueue.where('status').equals('pending').sortBy('id');
-      if (!sendableNow(pending, Date.now()).length) return;
+      const allQueue = await db.syncQueue.orderBy('id').toArray();
+      const pending = allQueue.filter((item) => item.status === 'pending');
+      if (!sendableNow(pending, Date.now(), allQueue).length) return;
       await withSyncLock(drainQueue);
     } catch (err) {
       console.error('[SyncEngine] Queue run failed', err);
@@ -455,6 +733,7 @@ export function SyncEngine() {
   // later sales have already sent are left out of it (overtakenBottleIds), so a retry
   // never rolls a bottle back.
   const handleRetry = async (item: SyncOperation) => {
+    await reapplyOptimisticLocalOp(item);
     await db.syncQueue.update(item.id!, {
       status: 'pending', retryCount: 0, attempts: 0, busyAnswers: 0, nextAttemptAt: 0, lastOutcome: undefined,
     });
@@ -467,8 +746,7 @@ export function SyncEngine() {
       toast.error('Discard needs internet, so the cloud can be checked first.');
       return;
     }
-    const saleId: string | undefined = item.type === 'process_checkout' ? item.payload?.p_sale_data?.id : undefined;
-    const onServer = saleId ? await saleIsOnServer(item.payload?.p_shop_id, saleId) : null;
+    const onServer = await itemIsAlreadyOnServer(item);
     const warning = onServer
       ? `${describeItem(item)} is already saved in the cloud, so removing this copy loses nothing.`
       : `${describeItem(item)} has NOT reached the cloud. Discarding it loses it from your records for good.`;
@@ -484,9 +762,10 @@ export function SyncEngine() {
           const current = await db.syncQueue.get(item.id!);
           if (!current) return;
           downloadJson([current], `discarded_item_${current.id}`);
+          await revertOptimisticLocalOp(current, { deleteQueueRow: true });
           await db.syncQueue.delete(current.id!);
           toast.success('Item discarded. A copy was downloaded.');
-          // The device copy still holds this item's changes: read those rows again.
+          // The device copy still holds non-ledger item changes: read those rows again.
           refreshSent([current]);
         });
       } finally {

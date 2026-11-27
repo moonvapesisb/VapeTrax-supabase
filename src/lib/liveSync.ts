@@ -1,7 +1,18 @@
 import type { RealtimeChannel } from '@supabase/supabase-js';
 import { supabase } from './supabase';
-import { db } from './db';
-import { reconcileCloudToLocal, syncCloudToLocal, type LocalTable } from './sync';
+import {
+  db,
+  ExpenseRow,
+  FinanceAccountRow,
+  FinanceTransactionRow,
+} from './db';
+import {
+  reconcileCloudToLocal,
+  syncCloudToLocal,
+  syncFinanceFromCloud,
+  type LocalTable,
+} from './sync';
+import { fetchLinkedShopsFinanceSummary } from './financeAccounts';
 import { applyServerRows, refreshLocalBottles, refreshLocalRows, removeLocalRows } from './liveStock';
 import { freshTicket } from './freshness';
 
@@ -63,7 +74,7 @@ export interface TableChangedDetail {
   /** What happened, when it is one kind of change. */
   event?: 'INSERT' | 'UPDATE' | 'DELETE';
   /** Complete rows as the server sent them (remote INSERT or UPDATE). */
-  rows?: any[];
+  rows?: Array<Record<string, unknown> & { id: string }>;
   /** Ids that were deleted, when known. */
   ids?: string[];
 }
@@ -131,11 +142,12 @@ const FULL_REFRESH_EVERY_MS = 3 * 60 * 60 * 1000;
 /** The backstop timer (row counts while connected; a catch-up while it can't connect). */
 const CHECK_EVERY_MS = 3 * 60_000;
 const POLL_WHILE_DOWN_MS = 5 * 60_000;
+const LINKED_SUMMARY_POLL_MS = 45_000;
 const RECONNECT_MIN_MS = 2000;
 const RECONNECT_MAX_MS = 60_000;
 
 interface Batch {
-  rows: Map<string, any>;
+  rows: Map<string, Record<string, unknown> & { id: string }>;
   /** id -> ticket of the live update that brought it (freshness.ts). */
   tickets: Map<string, number>;
   removed: Map<string, number>;
@@ -201,6 +213,10 @@ interface LiveState {
   /** When each list last read again because of a delete message, and the read waiting for its turn. */
   hintListAt: Map<LiveTable, number>;
   hintListTimers: Map<LiveTable, ReturnType<typeof setTimeout>>;
+  financeChannel: RealtimeChannel | null;
+  linkedFinanceChannels: Map<string, RealtimeChannel>;
+  linkedSummaryTimer: ReturnType<typeof setTimeout> | null;
+  isAdmin: boolean | null;
   cleanup: (() => void)[];
 }
 
@@ -283,7 +299,10 @@ const runCatchUp = async (state: LiveState): Promise<void> => {
     const { data } = await supabase.auth.getSession();
     if (!state.stopped && data.session) {
       for (const table of LIST_TABLES) emit({ table, source: 'catch-up' });
-      ok = full ? await syncCloudToLocal(state.shopId) : await reconcileCloudToLocal(state.shopId);
+      const stockOk = full ? await syncCloudToLocal(state.shopId) : await reconcileCloudToLocal(state.shopId);
+      const financeOk = await syncFinanceFromCloud(state.shopId);
+      ok = stockOk && financeOk;
+      if (!state.stopped) await syncLinkedFinanceChannels(state);
       if (ok && full) cu.lastFullAt = Date.now();
       if (ok && !state.stopped) for (const table of LOCAL_TABLES) emit({ table, source: 'catch-up' });
     }
@@ -499,7 +518,14 @@ const flush = async (state: LiveState) => {
   }, delay);
 };
 
-const onRowChange = (state: LiveState, table: LiveTable, payload: any) => {
+interface RealtimeRowPayload {
+  eventType?: string;
+  old?: Record<string, unknown>;
+  new?: Record<string, unknown>;
+  errors?: unknown[];
+}
+
+const onRowChange = (state: LiveState, table: LiveTable, payload: RealtimeRowPayload) => {
   if (state.stopped) return;
   const event = payload?.eventType as TableChangedDetail['event'];
   const row = event === 'DELETE' ? payload?.old : payload?.new;
@@ -526,7 +552,7 @@ const onRowChange = (state: LiveState, table: LiveTable, payload: any) => {
     } else {
       batch.removed.delete(id);
       batch.reread.delete(id);
-      batch.rows.set(id, { ...(batch.rows.get(id) || {}), ...row });
+      batch.rows.set(id, { ...(batch.rows.get(id) || {}), ...row, id });
       batch.tickets.set(id, ticket);
     }
     scheduleApply(state);
@@ -540,11 +566,15 @@ const onRowChange = (state: LiveState, table: LiveTable, payload: any) => {
     scheduleApply(state);
   }
 
+  if (table === 'expenses' && !partial) {
+    void applyExpenseLiveEvent(state.shopId, event, row as ExpenseRow, id);
+  }
+
   emit({
     table,
     source: 'remote',
     event,
-    rows: event !== 'DELETE' && !partial ? [row] : undefined,
+    rows: event !== 'DELETE' && !partial && row ? [{ ...row, id }] : undefined,
     ids: event === 'DELETE' ? [id] : undefined,
   });
 };
@@ -593,8 +623,13 @@ const scheduleHintRereads = (state: LiveState) => {
  * Another device says it deleted rows. Nothing is removed on its word alone, and what
  * such messages cost is capped (see the note at the top).
  */
-const onHint = (state: LiveState, payload: any) => {
-  if (state.stopped || !isLiveTable(payload?.table)) return;
+const onHint = (state: LiveState, rawPayload: unknown) => {
+  if (state.stopped) return;
+  const payload = (typeof rawPayload === 'object' && rawPayload !== null ? rawPayload : {}) as {
+    table?: unknown;
+    ids?: unknown;
+  };
+  if (!isLiveTable(payload.table)) return;
   const table: LiveTable = payload.table;
   if (!isLocalTable(table)) {
     hintListRefresh(state, table);
@@ -639,6 +674,8 @@ const onStatus = (state: LiveState, channel: RealtimeChannel, status: string, er
     }
     if (state.stale) catchUp(state, true);
     sendHints(state);
+    void syncLinkedFinanceChannels(state);
+    void refreshLinkedSummaryNow(state);
     return;
   }
   state.subscribed = false;
@@ -735,6 +772,7 @@ const connect = async (state: LiveState): Promise<void> => {
     });
     state.channel = channel;
     channel.subscribe((status, err) => onStatus(state, channel, status, err));
+    await connectFinanceChannel(state);
   } catch (err) {
     console.warn('[LiveSync] Could not connect; trying again later.', err);
     scheduleReconnect(state);
@@ -775,12 +813,17 @@ export function startLiveSync(shopId: string): () => void {
     hintBudget: { since: 0, used: 0, warned: false },
     hintListAt: new Map(),
     hintListTimers: new Map(),
+    financeChannel: null,
+    linkedFinanceChannels: new Map(),
+    linkedSummaryTimer: null,
+    isAdmin: null,
     cleanup: [],
   };
   current = state;
 
   const onOnline = () => {
     state.fallbackDone = false;
+    void refreshLinkedSummaryNow(state);
     if (state.subscribed) {
       // The connection may not have noticed the outage: catch up now.
       catchUp(state, true);
@@ -793,21 +836,33 @@ export function startLiveSync(shopId: string): () => void {
   };
   const onOffline = () => { state.stale = true; };
   const onVisible = () => {
-    if (document.visibilityState !== 'visible' || state.subscribed || isOffline()) return;
+    if (document.visibilityState !== 'visible' || isOffline()) return;
+    void refreshLinkedSummaryNow(state);
+    if (state.subscribed) return;
     if (!state.channel) void connect(state);
     else supabase.realtime.connect();
   };
+  const onFocus = () => {
+    if (isOffline() || isHidden()) return;
+    void refreshLinkedSummaryNow(state);
+  };
   window.addEventListener('online', onOnline);
   window.addEventListener('offline', onOffline);
+  window.addEventListener('focus', onFocus);
   document.addEventListener('visibilitychange', onVisible);
   state.cleanup.push(() => {
     window.removeEventListener('online', onOnline);
     window.removeEventListener('offline', onOffline);
+    window.removeEventListener('focus', onFocus);
     document.removeEventListener('visibilitychange', onVisible);
   });
 
-  if (!isOffline()) scheduleFallback(state);
+  if (!isOffline()) {
+    scheduleFallback(state);
+    void syncFinanceFromCloud(shopId);
+  }
   scheduleCheck(state);
+  scheduleLinkedSummaryPoll(state);
   void connect(state);
   return () => {
     if (current === state) stopLiveSync();
@@ -823,11 +878,236 @@ export function stopLiveSync(): void {
   for (const timer of Object.values(state.timers)) if (timer) clearTimeout(timer);
   for (const timer of state.hintListTimers.values()) clearTimeout(timer);
   state.hintListTimers.clear();
+  if (state.linkedSummaryTimer) {
+    clearTimeout(state.linkedSummaryTimer);
+    state.linkedSummaryTimer = null;
+  }
   state.cleanup.forEach(fn => fn());
   const channel = state.channel;
   state.channel = null;
   state.subscribed = false;
   if (channel) removeChannelLater(channel);
+  const finChannel = state.financeChannel;
+  state.financeChannel = null;
+  if (finChannel) removeChannelLater(finChannel);
+  for (const ch of state.linkedFinanceChannels.values()) removeChannelLater(ch);
+  state.linkedFinanceChannels.clear();
+}
+
+// ---------------------------------------------------------------------------
+// Finance & Linked-Shop Realtime + Periodic Summary Refresh
+// ---------------------------------------------------------------------------
+
+async function resolveAdminRole(state: LiveState): Promise<boolean> {
+  if (state.isAdmin !== null) return state.isAdmin;
+  const { data: userData } = await supabase.auth.getUser();
+  const uid = userData.user?.id;
+  if (!uid) return false;
+  const { data: profile } = await supabase
+    .from('profiles')
+    .select('role,shopId')
+    .eq('id', uid)
+    .maybeSingle();
+  const isAdmin = profile?.role === 'admin' && profile?.shopId === state.shopId;
+  state.isAdmin = isAdmin;
+  return isAdmin;
+}
+
+async function applyFinanceAccountLiveEvent(
+  event: 'INSERT' | 'UPDATE' | 'DELETE',
+  row: FinanceAccountRow,
+  sharedBankOnly: boolean,
+): Promise<void> {
+  if (event === 'DELETE') {
+    if (row?.id) await db.financeAccounts.delete(String(row.id));
+    return;
+  }
+  if (!row?.id) return;
+  if (sharedBankOnly && row.type !== 'secondaryBank') return;
+
+  await db.transaction('rw', [db.financeAccounts, db.syncQueue], async () => {
+    const ops = await db.syncQueue.where('status').equals('pending').toArray();
+    const hasPendingTouch = ops.some((op) => {
+      if (op.localRollback?.rolledBack) return false;
+      if (op.localRollback?.addedAccount?.id === row.id) return true;
+      if (op.localRollback?.accountBackup?.id === row.id) return true;
+      return (op.localRollback?.txEffects ?? []).some((e) => e.accountId === row.id);
+    });
+    if (!hasPendingTouch) {
+      await db.financeAccounts.put(row);
+    }
+  });
+}
+
+async function applyFinanceTxLiveEvent(
+  state: LiveState,
+  event: 'INSERT' | 'UPDATE' | 'DELETE',
+  row: FinanceTransactionRow,
+  sharedBankOnly: boolean,
+): Promise<void> {
+  if (event === 'DELETE' || !row?.id) return;
+  if (sharedBankOnly) {
+    const acc = await db.financeAccounts.get(row.accountId);
+    if (acc && acc.type !== 'secondaryBank') return;
+    if (!acc) {
+      // A shared secondaryBank tx arrived before its account was cached locally.
+      void syncFinanceFromCloud(state.shopId, { isAdmin: state.isAdmin ?? undefined });
+    }
+  }
+  await db.financeTransactions.put(row);
+}
+
+async function applyExpenseLiveEvent(
+  shopId: string,
+  event: 'INSERT' | 'UPDATE' | 'DELETE',
+  row: ExpenseRow,
+  id: string,
+): Promise<void> {
+  await db.transaction('rw', [db.expenses, db.syncQueue], async () => {
+    const ops = await db.syncQueue.where('status').equals('pending').toArray();
+    const hasPendingTouch = ops.some((op) => {
+      if (op.localRollback?.rolledBack) return false;
+      return op.payload?.p_expense_id === id;
+    });
+    if (hasPendingTouch) return;
+    if (event === 'DELETE') {
+      await db.expenses.delete(id);
+    } else if (row?.id && row.shopId === shopId) {
+      await db.expenses.put(row);
+    }
+  });
+}
+
+async function fetchDirectLinkedShopIds(shopId: string): Promise<string[]> {
+  const { data, error } = await supabase
+    .from('shop_links')
+    .select('shopA,shopB')
+    .or(`shopA.eq.${shopId},shopB.eq.${shopId}`);
+  if (error || !data) return [];
+  const linked = new Set<string>();
+  for (const row of data) {
+    const other = row.shopA === shopId ? row.shopB : row.shopB === shopId ? row.shopA : '';
+    if (other && other !== shopId) linked.add(other);
+  }
+  return [...linked];
+}
+
+async function syncLinkedFinanceChannels(state: LiveState): Promise<void> {
+  if (state.stopped || isOffline()) return;
+  const isAdmin = await resolveAdminRole(state);
+  const linkedIds = isAdmin ? await fetchDirectLinkedShopIds(state.shopId) : [];
+  if (state.stopped) return;
+
+  const desired = new Set<string>(linkedIds);
+  for (const [linkedId, ch] of state.linkedFinanceChannels) {
+    if (!desired.has(linkedId)) {
+      state.linkedFinanceChannels.delete(linkedId);
+      removeChannelLater(ch);
+    }
+  }
+
+  for (const linkedId of desired) {
+    if (state.linkedFinanceChannels.has(linkedId) || state.stopped) continue;
+    const topic = `shop-finance-link:${state.shopId}:${linkedId}`;
+    const leftover = supabase.getChannels().find((c) => c.topic === `realtime:${topic}`);
+    if (leftover) await supabase.removeChannel(leftover);
+    if (state.stopped) return;
+
+    const ch = supabase.channel(topic);
+    ch.on(
+      'postgres_changes',
+      { event: '*', schema: 'public', table: 'finance_accounts', filter: `ownerShopId=eq.${linkedId}` },
+      (payload) => {
+        const evt = payload.eventType as 'INSERT' | 'UPDATE' | 'DELETE';
+        const row = (evt === 'DELETE' ? payload.old : payload.new) as FinanceAccountRow;
+        void applyFinanceAccountLiveEvent(evt, row, true);
+      },
+    );
+    ch.on(
+      'postgres_changes',
+      { event: 'INSERT', schema: 'public', table: 'finance_transactions', filter: `ownerShopId=eq.${linkedId}` },
+      (payload) => {
+        void applyFinanceTxLiveEvent(state, 'INSERT', payload.new as FinanceTransactionRow, true);
+      },
+    );
+    state.linkedFinanceChannels.set(linkedId, ch);
+    ch.subscribe();
+  }
+}
+
+async function connectFinanceChannel(state: LiveState): Promise<void> {
+  if (state.stopped || state.financeChannel || isOffline()) return;
+  const topic = `shop-finance:${state.shopId}`;
+  const leftover = supabase.getChannels().find((c) => c.topic === `realtime:${topic}`);
+  if (leftover) await supabase.removeChannel(leftover);
+  if (state.stopped) return;
+
+  const channel = supabase.channel(topic);
+  channel.on(
+    'postgres_changes',
+    { event: '*', schema: 'public', table: 'finance_accounts', filter: `ownerShopId=eq.${state.shopId}` },
+    (payload) => {
+      const evt = payload.eventType as 'INSERT' | 'UPDATE' | 'DELETE';
+      const row = (evt === 'DELETE' ? payload.old : payload.new) as FinanceAccountRow;
+      void applyFinanceAccountLiveEvent(evt, row, false);
+    },
+  );
+  channel.on(
+    'postgres_changes',
+    { event: 'INSERT', schema: 'public', table: 'finance_transactions', filter: `ownerShopId=eq.${state.shopId}` },
+    (payload) => {
+      void applyFinanceTxLiveEvent(state, 'INSERT', payload.new as FinanceTransactionRow, false);
+    },
+  );
+  const onLinkChange = () => {
+    if (state.stopped) return;
+    void syncLinkedFinanceChannels(state);
+    void syncFinanceFromCloud(state.shopId, { isAdmin: state.isAdmin ?? undefined });
+  };
+  channel.on(
+    'postgres_changes',
+    { event: '*', schema: 'public', table: 'shop_links', filter: `shopA=eq.${state.shopId}` },
+    onLinkChange,
+  );
+  channel.on(
+    'postgres_changes',
+    { event: '*', schema: 'public', table: 'shop_links', filter: `shopB=eq.${state.shopId}` },
+    onLinkChange,
+  );
+
+  state.financeChannel = channel;
+  channel.subscribe((status) => {
+    if (state.stopped || state.financeChannel !== channel) return;
+    if (status === 'SUBSCRIBED') {
+      void syncLinkedFinanceChannels(state);
+    }
+  });
+}
+
+async function refreshLinkedSummaryNow(state: LiveState): Promise<void> {
+  if (state.stopped || isOffline()) return;
+  const isAdmin = await resolveAdminRole(state);
+  if (!isAdmin || state.stopped) return;
+  const prevIds = [...state.linkedFinanceChannels.keys()].sort().join(',');
+  await fetchLinkedShopsFinanceSummary(state.shopId, isAdmin);
+  if (state.stopped) return;
+  const linkedIds = (await db.linkedShopSummaries.toArray()).map((s) => s.shopId).sort().join(',');
+  if (linkedIds !== prevIds) {
+    await syncLinkedFinanceChannels(state);
+    await syncFinanceFromCloud(state.shopId, { isAdmin });
+  }
+}
+
+function scheduleLinkedSummaryPoll(state: LiveState): void {
+  if (state.stopped || state.linkedSummaryTimer) return;
+  state.linkedSummaryTimer = setTimeout(() => {
+    state.linkedSummaryTimer = null;
+    if (state.stopped) return;
+    if (!isOffline() && !isHidden()) {
+      void refreshLinkedSummaryNow(state);
+    }
+    scheduleLinkedSummaryPoll(state);
+  }, LINKED_SUMMARY_POLL_MS);
 }
 
 /**

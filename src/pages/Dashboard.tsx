@@ -12,8 +12,21 @@ import {
   TrendingDown,
   AlertTriangle,
   FileDown,
-  Calendar
+  Calendar,
+  Landmark,
+  ArrowRight,
+  Building2,
 } from 'lucide-react';
+import { Link } from 'react-router-dom';
+import { useLiveQuery } from 'dexie-react-hooks';
+import { db } from '../lib/db';
+import {
+  FINANCE_ACCOUNT_TYPE_LABELS,
+  isOverdrawn,
+  summarizeVisibleFinanceView,
+  type FinanceAccountType,
+} from '../lib/financeAccounts';
+import { useShopPermissions } from '../lib/permissions';
 import { getSalesCogs, getSaleItemCogs } from '../lib/finance';
 import { seedSampleData } from '../lib/seedData';
 import toast from 'react-hot-toast';
@@ -67,9 +80,36 @@ const getBusinessDay = (date: Date) => {
 
 const Dashboard: React.FC = () => {
   const { shopId } = useAuth();
-  
+  const { isAdmin } = useShopPermissions();
+
   // Products from global memory cache (0 reads)
   const { products, productsLoading } = useData();
+
+  const financeAccountsRaw = useLiveQuery(() => db.financeAccounts.toArray(), []);
+  const financeTransactionsRaw = useLiveQuery(() => db.financeTransactions.toArray(), []);
+  const linkedSummariesRaw = useLiveQuery(() => db.linkedShopSummaries.toArray(), []);
+  const queueOpsRaw = useLiveQuery(() => db.syncQueue.toArray(), []);
+
+  const {
+    linkedSummaries,
+    shopLabelById,
+    combinedTotals,
+    mismatches: financeMismatches,
+    ownCashAccount,
+    ownPrimaryAccount,
+    accessibleBanks,
+  } = React.useMemo(
+    () =>
+      summarizeVisibleFinanceView({
+        accounts: financeAccountsRaw || [],
+        transactions: financeTransactionsRaw || [],
+        linkedSummaries: linkedSummariesRaw || [],
+        queueOps: queueOpsRaw || [],
+        shopId: shopId || '',
+        isAdmin,
+      }),
+    [financeAccountsRaw, financeTransactionsRaw, linkedSummariesRaw, queueOpsRaw, shopId, isAdmin],
+  );
 
   const [seeding, setSeeding] = React.useState(false);
   const [activePeriod, setActivePeriod] = React.useState<'daily' | 'weekly' | 'monthly' | 'custom'>('daily');
@@ -295,6 +335,176 @@ const Dashboard: React.FC = () => {
           </div>
         </div>
       )}
+
+      {financeMismatches.length > 0 && (
+        <div role="alert" className="flex items-start gap-3 rounded-2xl border border-amber-300 bg-amber-50 p-4 text-sm text-amber-900">
+          <AlertTriangle size={18} className="mt-0.5 shrink-0 text-amber-600" />
+          <div className="flex-1">
+            <p className="font-bold">Account balance reconciliation warning</p>
+            <p className="text-xs mt-1">
+              {financeMismatches.map((m) => `${m.accountName} (cached ${formatCurrency(m.cachedBalance)} vs ledger ${formatCurrency(m.ledgerBalance)})`).join('; ')}
+            </p>
+          </div>
+          {isAdmin && (
+            <Link to="/cash" className="text-xs font-bold text-amber-800 underline shrink-0">
+              Review in Manage Cash
+            </Link>
+          )}
+        </div>
+      )}
+
+      {/* Live Cash & Bank Accounts Snapshot (Dexie offline-first) */}
+      <div className="space-y-4">
+        <div className="flex items-center gap-2 px-2">
+          <Landmark className="text-violet-600" size={22} />
+          <h2 className="text-xl font-bold text-slate-900">
+            {isAdmin ? 'Live Cash & Bank Balances' : 'Shop Cash Register'}
+          </h2>
+          {isAdmin && (
+            <Link
+              to="/cash"
+              className="ml-auto inline-flex items-center gap-1.5 text-xs font-bold text-violet-700 hover:text-violet-800 bg-violet-50 hover:bg-violet-100 px-3 py-1.5 rounded-xl transition-colors"
+            >
+              Manage Cash
+              <ArrowRight size={14} />
+            </Link>
+          )}
+        </div>
+
+        <div className={cn("grid grid-cols-1 gap-4", isAdmin ? "md:grid-cols-2 lg:grid-cols-4" : "max-w-sm")}>
+          {isAdmin && (
+            <div className="glass-card p-5 border-l-4 border-l-violet-600">
+              <p className="text-[10px] font-bold uppercase tracking-widest text-slate-400">Combined Total</p>
+              <p className="text-2xl font-black text-slate-900 mt-1">{formatCurrency(combinedTotals.combinedTotal)}</p>
+              <p className="text-[11px] text-slate-500 mt-2">
+                Own cash + primary ({formatCurrency(combinedTotals.ownCash + combinedTotals.ownPrimary)})
+                {combinedTotals.accessibleBanks !== 0 && ` · Banks ${formatCurrency(combinedTotals.accessibleBanks)}`}
+                {combinedTotals.linkedCashAndPrimary !== 0 && ` · Branches ${formatCurrency(combinedTotals.linkedCashAndPrimary)}`}
+              </p>
+            </div>
+          )}
+
+          {ownCashAccount && (
+            <div className="glass-card p-5 border-l-4 border-l-emerald-500">
+              <div className="flex items-center justify-between gap-2">
+                <p className="text-[10px] font-bold uppercase tracking-widest text-slate-400">{ownCashAccount.name}</p>
+                {isOverdrawn(ownCashAccount) && (
+                  <span className="px-2 py-0.5 rounded-full text-[10px] font-black uppercase bg-rose-100 text-rose-700">
+                    Overdrawn
+                  </span>
+                )}
+              </div>
+              <p className={cn("text-2xl font-black mt-1", isOverdrawn(ownCashAccount) ? "text-rose-600" : "text-slate-900")}>
+                {formatCurrency(ownCashAccount.balance)}
+              </p>
+              <p className="text-[11px] text-slate-500 mt-2">{FINANCE_ACCOUNT_TYPE_LABELS[ownCashAccount.type as FinanceAccountType] ?? 'Shop Cash'}</p>
+            </div>
+          )}
+
+          {isAdmin && ownPrimaryAccount && (
+            <div className="glass-card p-5 border-l-4 border-l-cyan-500">
+              <div className="flex items-center justify-between gap-2">
+                <p className="text-[10px] font-bold uppercase tracking-widest text-slate-400">{ownPrimaryAccount.name}</p>
+                {isOverdrawn(ownPrimaryAccount) && (
+                  <span className="px-2 py-0.5 rounded-full text-[10px] font-black uppercase bg-rose-100 text-rose-700">
+                    Overdrawn
+                  </span>
+                )}
+              </div>
+              <p className={cn("text-2xl font-black mt-1", isOverdrawn(ownPrimaryAccount) ? "text-rose-600" : "text-slate-900")}>
+                {formatCurrency(ownPrimaryAccount.balance)}
+              </p>
+              <p className="text-[11px] text-slate-500 mt-2">
+                {ownPrimaryAccount.bankName || 'Primary Online Account'}
+              </p>
+            </div>
+          )}
+
+          {isAdmin && (
+            <div className="glass-card p-5 border-l-4 border-l-amber-500">
+              <div className="flex items-center justify-between gap-2">
+                <p className="text-[10px] font-bold uppercase tracking-widest text-slate-400">
+                  Bank Accounts ({accessibleBanks.length})
+                </p>
+                {accessibleBanks.some((b) => isOverdrawn(b)) && (
+                  <span className="px-2 py-0.5 rounded-full text-[10px] font-black uppercase bg-rose-100 text-rose-700">
+                    Overdrawn
+                  </span>
+                )}
+              </div>
+              <p className={cn(
+                "text-2xl font-black mt-1",
+                combinedTotals.accessibleBanks < 0 ? "text-rose-600" : "text-slate-900",
+              )}>
+                {formatCurrency(combinedTotals.accessibleBanks)}
+              </p>
+              <div className="text-[11px] text-slate-500 mt-2 space-y-1">
+                {accessibleBanks.length ? (
+                  accessibleBanks.slice(0, 3).map((b) => (
+                    <div key={b.id} className="flex items-center justify-between gap-2 truncate">
+                      <span className="truncate">
+                        {b.name}
+                        {b.ownerShopId !== shopId && (
+                          <span className="text-indigo-700 font-semibold">
+                            {' '}· Shared ({shopLabelById.get(b.ownerShopId) ?? b.ownerShopId.slice(0, 8)})
+                          </span>
+                        )}
+                      </span>
+                      <span className={cn("font-semibold shrink-0", isOverdrawn(b) && "text-rose-600")}>
+                        {formatCurrency(b.balance)}
+                      </span>
+                    </div>
+                  ))
+                ) : (
+                  <p>No secondary banks added</p>
+                )}
+              </div>
+            </div>
+          )}
+        </div>
+
+        {isAdmin && linkedSummaries.length > 0 && (
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+            {linkedSummaries.map((branch) => (
+              <div key={branch.shopId} className="glass-card p-4 flex flex-col gap-2">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="inline-flex items-center gap-1.5 text-xs font-bold text-slate-800">
+                    <Building2 size={14} className="text-violet-600" />
+                    {branch.shopName}
+                  </span>
+                  <span className="text-[10px] font-semibold text-slate-400">
+                    As of {new Date(branch.fetchedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                  </span>
+                </div>
+                <div className="grid grid-cols-2 gap-3 text-xs">
+                  <div className="bg-slate-50 rounded-xl p-2.5">
+                    <div className="flex items-center justify-between">
+                      <span className="text-slate-400 font-semibold">Cash</span>
+                      {branch.shopCashOverdrawn && (
+                        <span className="text-[9px] font-black uppercase text-rose-600">Overdrawn</span>
+                      )}
+                    </div>
+                    <p className={cn("font-bold mt-0.5", branch.shopCashOverdrawn ? "text-rose-600" : "text-slate-900")}>
+                      {formatCurrency(branch.shopCashBalance)}
+                    </p>
+                  </div>
+                  <div className="bg-slate-50 rounded-xl p-2.5">
+                    <div className="flex items-center justify-between">
+                      <span className="text-slate-400 font-semibold truncate">{branch.primaryOnlineName}</span>
+                      {branch.primaryOnlineOverdrawn && (
+                        <span className="text-[9px] font-black uppercase text-rose-600">Overdrawn</span>
+                      )}
+                    </div>
+                    <p className={cn("font-bold mt-0.5", branch.primaryOnlineOverdrawn ? "text-rose-600" : "text-slate-900")}>
+                      {formatCurrency(branch.primaryOnlineBalance)}
+                    </p>
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
 
       {/* KPI Section */}
       <div className="space-y-4">

@@ -13,7 +13,8 @@
     "sql:check": "node supabase/rehearsal/check.mjs",
     "sql:rehearse": "node supabase/rehearsal/run.mjs",
     "build:clone-sql": "node scripts/build-clone-sql.mjs",
-    "friend:copy": "node scripts/make-friend-copy.mjs"
+    "friend:copy": "node scripts/make-friend-copy.mjs",
+    "test:finance": "tsx --test src/lib/__tests__/financeAccounts.test.ts"
   },
   "dependencies": {
     "@google/genai": "^1.29.0",

@@ -1,10 +1,43 @@
 import { supabase } from './supabase';
 import { parseBottleSizeMl } from './bottles';
+import { syncFinanceFromCloud } from './sync';
 
-export const reverseSaleImpact = async (sale: any, shopId: string, actorMeta: any, isEdit: boolean = false, deleteSale: boolean = false) => {
-  const bottleUpdates: any[] = [];
-  const productUpdates: any[] = [];
-  const inventoryLogs: any[] = [];
+interface ReversalBottleChange {
+  bottleId?: string;
+  beforeRemainingMl?: number;
+  beforeStatus?: string;
+  beforeOpenedDate?: string | null;
+}
+
+interface ReversalSaleItem {
+  productId: string;
+  productName?: string;
+  saleType?: string;
+  bottleSize?: string | number | null;
+  refillAmount?: number;
+  quantity?: number;
+  bottleChanges?: ReversalBottleChange[];
+}
+
+export interface ReversalSaleInput {
+  id: string;
+  customerId?: string | null;
+  paymentMethod?: string | null;
+  totalAmount?: number;
+  splitAmounts?: { credit?: number } | null;
+  items: ReversalSaleItem[];
+}
+
+export const reverseSaleImpact = async (
+  sale: ReversalSaleInput,
+  shopId: string,
+  actorMeta: Record<string, unknown>,
+  isEdit: boolean = false,
+  deleteSale: boolean = false,
+) => {
+  const bottleUpdates: Array<Record<string, unknown>> = [];
+  const productUpdates: Array<Record<string, unknown>> = [];
+  const inventoryLogs: Array<Record<string, unknown>> = [];
 
   // Reverse inventory changes
   for (const item of sale.items) {
@@ -25,7 +58,7 @@ export const reverseSaleImpact = async (sale: any, shopId: string, actorMeta: an
         });
       }
 
-      const bottleChanges: any[] = Array.isArray(item.bottleChanges) ? item.bottleChanges : [];
+      const bottleChanges = Array.isArray(item.bottleChanges) ? item.bottleChanges : [];
       for (const bc of bottleChanges) {
         if (!bc?.bottleId) continue;
         bottleUpdates.push({
@@ -82,9 +115,9 @@ export const reverseSaleImpact = async (sale: any, shopId: string, actorMeta: an
   // Reverse credit if applicable
   let creditToReverse = 0;
   if (sale.paymentMethod === 'credit') {
-    creditToReverse = sale.totalAmount;
+    creditToReverse = Number(sale.totalAmount) || 0;
   } else if (sale.paymentMethod === 'split') {
-    creditToReverse = sale.splitAmounts?.credit || 0;
+    creditToReverse = Number(sale.splitAmounts?.credit) || 0;
   }
 
   const { error } = await supabase.rpc('process_reversal', {
@@ -107,9 +140,16 @@ export const reverseSaleImpact = async (sale: any, shopId: string, actorMeta: an
       hint: error.hint,
     });
   }
+
+  // Reversals are never written optimistically to Dexie; refresh from server after RPC succeeds.
+  await syncFinanceFromCloud(shopId);
 };
 
-export const deleteSaleWithReversal = async (sale: any, shopId: string, actorMeta: any) => {
+export const deleteSaleWithReversal = async (
+  sale: ReversalSaleInput,
+  shopId: string,
+  actorMeta: Record<string, unknown>,
+) => {
   if (!shopId) throw new Error('Shop not loaded');
   await reverseSaleImpact(sale, shopId, actorMeta, false, true);
 };

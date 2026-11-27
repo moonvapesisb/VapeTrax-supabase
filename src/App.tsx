@@ -23,6 +23,7 @@ import InventoryLogs from './pages/InventoryLogs';
 import Settings from './pages/Settings';
 import Transfers from './pages/Transfers';
 import GlobalAgentWidget from './components/ai/GlobalAgentWidget';
+import ManageCash from './pages/ManageCash';
 
 const Layout: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   return (
@@ -117,6 +118,12 @@ function App() {
             <Route path="/transfers" element={
               <ProtectedRoute requiredRole="admin">
                 <Layout><Transfers /></Layout>
+              </ProtectedRoute>
+            } />
+
+            <Route path="/cash" element={
+              <ProtectedRoute requiredRole="admin">
+                <Layout><ManageCash /></Layout>
               </ProtectedRoute>
             } />
 

@@ -4,11 +4,68 @@ import { Database } from '../types/supabase';
 export type Product = Database['public']['Tables']['products']['Row'];
 export type Bottle = Database['public']['Tables']['bottles']['Row'];
 export type Customer = Database['public']['Tables']['customers']['Row'];
+export type FinanceAccountRow = Database['public']['Tables']['finance_accounts']['Row'];
+export type FinanceTransactionRow = Database['public']['Tables']['finance_transactions']['Row'];
+export type ExpenseRow = Database['public']['Tables']['expenses']['Row'];
+
+export interface LinkedShopFinanceSummary {
+  shopId: string;
+  shopName: string;
+  shopCashBalance: number;
+  shopCashOverdrawn: boolean;
+  primaryOnlineBalance: number;
+  primaryOnlineName: string;
+  primaryOnlineOverdrawn: boolean;
+  fetchedAt: string;
+}
+
+export type SyncOperationType =
+  | 'process_checkout'
+  | 'process_sale'
+  | 'process_stock_adjustment'
+  | 'insert_customer'
+  | 'update_product'
+  | 'create_finance_account'
+  | 'update_finance_account'
+  | 'archive_finance_account'
+  | 'record_opening_balance'
+  | 'transfer_funds'
+  | 'record_payout'
+  | 'record_expense'
+  | 'update_expense'
+  | 'delete_expense'
+  | 'record_credit_payment'
+  | 'reverse_finance_transaction';
+
+export interface FinanceTxRollbackEffect {
+  txId: string;
+  accountId: string;
+  direction: 'in' | 'out';
+  amount: number;
+}
+
+export interface FinanceLocalRollback {
+  rolledBack?: boolean;
+  addedTxs?: FinanceTransactionRow[];
+  txEffects?: FinanceTxRollbackEffect[];
+  addedAccount?: FinanceAccountRow;
+  accountBackup?: Pick<
+    FinanceAccountRow,
+    'id' | 'name' | 'bankName' | 'accountNumber' | 'isArchived' | 'archivedAt'
+  >;
+  addedExpenseId?: string;
+  expenseBackup?: ExpenseRow;
+  updatedExpense?: ExpenseRow;
+  creditCustomerId?: string;
+  creditPaymentAmount?: number;
+}
 
 export interface SyncOperation {
   id?: number; // Auto-incremented by Dexie
-  type: 'process_checkout' | 'process_sale' | 'process_stock_adjustment' | 'insert_customer' | 'update_product';
-  payload: any;
+  type: SyncOperationType;
+  payload: Record<string, unknown>;
+  /** Optimistic local finance/expense/credit snapshot so failed or discarded items can be cleanly rolled back (and re-applied on Retry). */
+  localRollback?: FinanceLocalRollback;
   /** 'failed' after 10 refusals by the server; it waits for Retry, Export or Discard. */
   status: 'pending' | 'failed';
   error?: string;
@@ -40,6 +97,10 @@ export class VapeTraxDB extends Dexie {
   bottles!: Table<Bottle, string>;
   customers!: Table<Customer, string>;
   syncQueue!: Table<SyncOperation, number>;
+  financeAccounts!: Table<FinanceAccountRow, string>;
+  financeTransactions!: Table<FinanceTransactionRow, string>;
+  expenses!: Table<ExpenseRow, string>;
+  linkedShopSummaries!: Table<LinkedShopFinanceSummary, string>;
 
   constructor() {
     super('VapeTraxDB');
@@ -55,6 +116,17 @@ export class VapeTraxDB extends Dexie {
 
       // Auto-incremented id. Index by status and createdAt.
       syncQueue: '++id, type, status, createdAt'
+    });
+
+    this.version(2).stores({
+      products: '&id, shopId, category, name',
+      bottles: '&id, shopId, productId, status, createdAt',
+      customers: '&id, shopId, name, phone',
+      syncQueue: '++id, type, status, createdAt',
+      financeAccounts: '&id, shopId, ownerShopId, type, isArchived',
+      financeTransactions: '&id, shopId, ownerShopId, accountId, occurredAt, type, referenceId, transferId',
+      expenses: '&id, shopId, expenseDate, paidFromAccountId',
+      linkedShopSummaries: '&shopId, fetchedAt',
     });
   }
 }

@@ -1,47 +1,73 @@
 import { supabase } from './supabase';
 
-// Every table that holds this shop's data, keyed by its shop column.
+// Every table that holds this shop's data.
 const SHOP_TABLES = [
-  'products', 'bottles', 'customers', 'sales', 'expenses', 'personal_expenses',
-  'inventory_logs', 'credits', 'settings',
-];
+  'products',
+  'bottles',
+  'customers',
+  'sales',
+  'expenses',
+  'personal_expenses',
+  'inventory_logs',
+  'credits',
+  'settings',
+  'finance_accounts',
+  'finance_transactions',
+] as const;
+
+type BackupTable = (typeof SHOP_TABLES)[number];
+type BackupRow = Record<string, unknown>;
 
 const PAGE_SIZE = 1000;
+
+function applyShopScope(
+  query: ReturnType<ReturnType<typeof supabase.from>['select']>,
+  table: BackupTable,
+  shopId: string,
+) {
+  // Finance backup exports only accounts and ledger rows owned by this shop (never shared banks owned by linked shops).
+  if (table === 'finance_accounts' || table === 'finance_transactions') {
+    return query.eq('ownerShopId', shopId);
+  }
+  return query.eq('shopId', shopId);
+}
 
 // Supabase returns at most 1000 rows per request, so read each table page by page.
 // Pages follow the id ("after the last id read"), not a row offset: a row saved or
 // deleted while the table is being read can't shift the pages, so no row is read
 // twice and none is skipped because others moved.
-const fetchAllRows = async (table: string, shopId: string): Promise<any[]> => {
-  const rows: any[] = [];
+const fetchAllRows = async (table: BackupTable, shopId: string): Promise<BackupRow[]> => {
+  const rows: BackupRow[] = [];
   if (table === 'settings') {
     // one row per shop and no id column
     for (let from = 0; ; from += PAGE_SIZE) {
-      const { data, error } = await supabase.from(table).select('*').eq('shopId', shopId)
+      const { data, error } = await applyShopScope(supabase.from(table).select('*'), table, shopId)
         .range(from, from + PAGE_SIZE - 1);
       if (error) throw new Error(`Backup failed while reading ${table}: ${error.message}`);
-      rows.push(...(data || []));
+      rows.push(...((data || []) as BackupRow[]));
       if (!data || data.length < PAGE_SIZE) return rows;
     }
   }
   let lastId: unknown = null;
   for (;;) {
-    let query = supabase.from(table).select('*').eq('shopId', shopId);
-    if (lastId !== null) query = query.gt('id', lastId);
+    let query = applyShopScope(supabase.from(table).select('*'), table, shopId);
+    if (lastId !== null) query = query.gt('id', String(lastId));
     const { data, error } = await query.order('id', { ascending: true }).limit(PAGE_SIZE);
     if (error) throw new Error(`Backup failed while reading ${table}: ${error.message}`);
-    rows.push(...(data || []));
-    if (!data || data.length < PAGE_SIZE) return rows;
-    lastId = (data[data.length - 1] as any).id;
+    const pageRows = (data || []) as BackupRow[];
+    rows.push(...pageRows);
+    if (pageRows.length < PAGE_SIZE) return rows;
+    lastId = pageRows[pageRows.length - 1].id;
   }
 };
 
 // How many rows the server says this shop has in the table.
-const countRows = async (table: string, shopId: string): Promise<number> => {
-  const { count, error } = await supabase
-    .from(table)
-    .select('*', { count: 'exact', head: true })
-    .eq('shopId', shopId);
+const countRows = async (table: BackupTable, shopId: string): Promise<number> => {
+  const { count, error } = await applyShopScope(
+    supabase.from(table).select('*', { count: 'exact', head: true }),
+    table,
+    shopId,
+  );
   if (error) throw new Error(`Backup failed while counting ${table}: ${error.message}`);
   if (count === null || count === undefined) throw new Error(`Backup failed: the server gave no row count for ${table}.`);
   return count;
@@ -54,7 +80,7 @@ const countRows = async (table: string, shopId: string): Promise<number> => {
  * saved while the table is being read can change the count, so a mismatch is read
  * once more before giving up.
  */
-const fetchCheckedRows = async (table: string, shopId: string): Promise<any[]> => {
+const fetchCheckedRows = async (table: BackupTable, shopId: string): Promise<BackupRow[]> => {
   let detail = '';
   for (let attempt = 1; attempt <= 2; attempt++) {
     const rows = await fetchAllRows(table, shopId);
@@ -72,12 +98,13 @@ const fetchCheckedRows = async (table: string, shopId: string): Promise<any[]> =
 export const exportBackup = async (shopId: string): Promise<void> => {
   if (!shopId) throw new Error('Shop not loaded');
 
-  const backupData: Record<string, any> = {};
+  const backupData: Record<string, unknown> = {};
   const counts: Record<string, number> = {};
 
   for (const table of SHOP_TABLES) {
-    backupData[table] = await fetchCheckedRows(table, shopId);
-    counts[table] = backupData[table].length;
+    const tableRows = await fetchCheckedRows(table, shopId);
+    backupData[table] = tableRows;
+    counts[table] = tableRows.length;
   }
 
   backupData._meta = {

@@ -1,4 +1,4 @@
-﻿import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import toast from 'react-hot-toast';
 import { NavLink, useNavigate } from 'react-router-dom';
 import {
@@ -116,6 +116,7 @@ const Sidebar: React.FC = () => {
   const topNavItems = [
     { name: 'New Sale', path: '/', icon: ShoppingCart, roles: ['admin', 'cashier'] },
     { name: 'Dashboard', path: '/dashboard', icon: LayoutDashboard, roles: ['admin'] },
+    { name: 'Manage Cash', path: '/cash', icon: Landmark, roles: ['admin'] },
     { name: 'Products', path: '/stock', icon: Package, roles: ['admin', 'cashier'] },
     { name: 'Expenses', path: '/expenses', icon: DollarSign, roles: ['admin', 'cashier'] },
     { name: 'Credit / Customers', path: '/customers', icon: Users, roles: ['admin', 'cashier'] },

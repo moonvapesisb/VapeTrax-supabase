@@ -58,6 +58,10 @@ export const RERUN_UNSAFE = new Map([
   // 20261012100000 a re-run fails ("cannot change return type") and rolls
   // back; it must still never be run again.
   ['20261011140000_stock_never_negative_refill_steps.sql', 'it would undo 20261012100000 (today it fails: the two RPCs now return jsonb)'],
+  // Its `create or replace` of process_checkout / process_reversal and its
+  // `drop_all_policies` on finance_accounts / finance_transactions would
+  // overwrite 20261127100000's finance ledger hooks and SELECT policies.
+  ['20261012100000_lockdown_followup.sql', 'it would overwrite 20261127100000 process_checkout/process_reversal and drop finance SELECT policies'],
 ]);
 
 /** Every migration in supabase/migrations, in filename (= apply) order. */

@@ -52,13 +52,16 @@ export interface QueueEffects {
   adjusted: Set<string>;
 }
 
-const asArray = (v: unknown): any[] => (Array.isArray(v) ? v : []);
+type LocalRow = Record<string, unknown>;
+
+const asArray = (v: unknown): LocalRow[] => (Array.isArray(v) ? (v as LocalRow[]) : []);
 const num = (v: unknown): number => {
   const n = Number(v);
   return Number.isFinite(n) ? n : 0;
 };
 const roundMoney = (n: number) => Math.round(n * 100) / 100;
-const hasKey = (row: any, key: string) => !!row && Object.prototype.hasOwnProperty.call(row, key);
+const hasKey = (row: LocalRow | undefined | null, key: string) =>
+  !!row && Object.prototype.hasOwnProperty.call(row, key);
 
 /**
  * The queue's effects (pure; the same rules as sync.ts). A checkout whose sale id is
@@ -68,13 +71,23 @@ const hasKey = (row: any, key: string) => !!row && Object.prototype.hasOwnProper
 export const queueEffects = (items: SyncOperation[], onServer: ReadonlySet<string>): QueueEffects => {
   const eff: QueueEffects = { stock: new Map(), credit: new Map(), bottles: new Set(), adjusted: new Set() };
   for (const op of items) {
+    if (op?.localRollback?.rolledBack) continue;
     const p = op?.payload || {};
     for (const b of [...asArray(p.p_bottle_updates), ...asArray(p.p_bottle_inserts)]) {
       if (b?.id) eff.bottles.add(String(b.id));
     }
     if (p.p_product_id) eff.adjusted.add(String(p.p_product_id));
+    if (op?.type === 'record_credit_payment') {
+      const creditId = p.p_credit_id ? String(p.p_credit_id) : '';
+      const amt = Number(p.p_amount);
+      if (creditId && !onServer.has(creditId) && p.p_customer_id && Number.isFinite(amt) && amt > 0) {
+        const cid = String(p.p_customer_id);
+        eff.credit.set(cid, (eff.credit.get(cid) || 0) - amt);
+      }
+      continue;
+    }
     if (op?.type !== 'process_checkout') continue;
-    const saleId = p.p_sale_data?.id;
+    const saleId = (p.p_sale_data as { id?: unknown } | undefined)?.id;
     if (saleId && onServer.has(String(saleId))) continue;
     for (const up of asArray(p.p_product_updates)) {
       const d = Number(up?.deduction);
@@ -89,11 +102,11 @@ export const queueEffects = (items: SyncOperation[], onServer: ReadonlySet<strin
 };
 
 /** A row the server has archived (since step 0.3 a delete from the app archives). */
-export const isArchivedRow = (table: LocalTable, row: any): boolean =>
+export const isArchivedRow = (table: LocalTable, row: LocalRow | undefined | null): boolean =>
   table === 'bottles' ? row?.archivedAt != null : row?.deletedAt != null;
 
 export interface RowPlan {
-  puts: any[];
+  puts: LocalRow[];
   deletes: string[];
 }
 
@@ -102,7 +115,12 @@ export interface RowPlan {
  * `rows[i]`, or undefined. Columns a row does not carry keep their local value, so a
  * partial live update never blanks a column.
  */
-export const planServerRows = (table: LocalTable, rows: any[], local: any[], eff: QueueEffects): RowPlan => {
+export const planServerRows = (
+  table: LocalTable,
+  rows: LocalRow[],
+  local: Array<LocalRow | undefined>,
+  eff: QueueEffects,
+): RowPlan => {
   const plan: RowPlan = { puts: [], deletes: [] };
   rows.forEach((row, i) => {
     const id = String(row.id);
@@ -128,15 +146,14 @@ export const planServerRows = (table: LocalTable, rows: any[], local: any[], eff
     }
     const merged = { ...(mine || {}), ...row };
     if (hasKey(row, 'creditBalance')) {
-      merged.creditBalance = roundMoney(num(row.creditBalance) + (eff.credit.get(id) || 0));
+      merged.creditBalance = Math.max(0, roundMoney(num(row.creditBalance) + (eff.credit.get(id) || 0)));
     }
     plan.puts.push(merged);
   });
   return plan;
 };
 
-const tableOf = (table: LocalTable) =>
-  (table === 'products' ? db.products : table === 'bottles' ? db.bottles : db.customers) as any;
+const tableOf = (table: LocalTable) => db.table<LocalRow, string>(table);
 
 const timeoutSignal = (ms: number): AbortSignal | undefined =>
   typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function' ? AbortSignal.timeout(ms) : undefined;
@@ -156,13 +173,22 @@ const salesOnServerFor = async (
   if (table === 'bottles') return new Set();
   const wanted = new Set(ids.map(String));
   const saleIds = new Set<string>();
+  const creditIds = new Set<string>();
   for (const op of await db.syncQueue.toArray()) {
-    if (op.type !== 'process_checkout') continue;
+    if (op.localRollback?.rolledBack) continue;
     const p = op.payload || {};
+    if (op.type === 'record_credit_payment' && table === 'customers') {
+      if (wanted.has(String(p.p_customer_id)) && p.p_credit_id) {
+        creditIds.add(String(p.p_credit_id));
+      }
+      continue;
+    }
+    if (op.type !== 'process_checkout') continue;
     const touches = table === 'products'
       ? asArray(p.p_product_updates).some(up => wanted.has(String(up?.id)))
       : wanted.has(String(p.p_customer_id));
-    if (touches && p.p_sale_data?.id) saleIds.add(String(p.p_sale_data.id));
+    const saleId = (p.p_sale_data as { id?: unknown } | undefined)?.id;
+    if (touches && saleId) saleIds.add(String(saleId));
   }
   const onServer = new Set<string>();
   const list = [...saleIds];
@@ -174,6 +200,19 @@ const salesOnServerFor = async (
       const { data, error } = await query;
       if (error) return null;
       (data || []).forEach((s: { id: string }) => onServer.add(String(s.id)));
+    } catch {
+      return null;
+    }
+  }
+  const creditList = [...creditIds];
+  for (let i = 0; i < creditList.length; i += ID_CHUNK) {
+    try {
+      let query = supabase.from('credits').select('id').eq('shopId', shopId).in('id', creditList.slice(i, i + ID_CHUNK)).retry(false);
+      const abort = signal ?? timeoutSignal(ON_SERVER_TIMEOUT_MS);
+      if (abort) query = query.abortSignal(abort);
+      const { data, error } = await query;
+      if (error) return null;
+      (data || []).forEach((c: { id: string }) => onServer.add(String(c.id)));
     } catch {
       return null;
     }
@@ -208,7 +247,7 @@ const ticketFor = (tickets: Tickets, id: string): number =>
 export async function applyServerRows(
   shopId: string,
   table: LocalTable,
-  rows: any[],
+  rows: LocalRow[],
   tickets: Tickets,
   onServer?: ReadonlySet<string> | null,
 ): Promise<void> {
@@ -241,7 +280,7 @@ export async function removeLocalRows(table: LocalTable, ids: string[], tickets:
     let gone = wanted;
     if (table === 'bottles') {
       const eff = queueEffects(await db.syncQueue.toArray(), new Set());
-      const rows: any[] = await local.bulkGet(gone);
+      const rows = await local.bulkGet(gone);
       gone = gone.filter((id, i) => !eff.bottles.has(id) && !(rows[i] && eff.adjusted.has(String(rows[i].productId))));
     }
     if (!gone.length) return;
@@ -262,12 +301,12 @@ export async function refreshLocalRows(shopId: string, table: LocalTable, ids: s
   try {
     // Before the rows are read (see the note at the top).
     const onServer = await salesOnServerFor(shopId, table, wanted);
-    const rows: any[] = [];
+    const rows: LocalRow[] = [];
     try {
       for (let i = 0; i < wanted.length; i += ID_CHUNK) {
         const { data, error } = await supabase.from(table).select('*').eq('shopId', shopId).in('id', wanted.slice(i, i + ID_CHUNK));
         if (error) return false;
-        rows.push(...(data || []));
+        rows.push(...((data || []) as LocalRow[]));
       }
     } catch {
       return false;
@@ -293,12 +332,12 @@ export async function writeThrough<T>(
   shopId: string,
   table: LocalTable,
   ids: string[],
-  write: (store: (rows: any[] | null | undefined) => Promise<void>) => Promise<T>,
+  write: (store: (rows: LocalRow[] | null | undefined) => Promise<void>) => Promise<T>,
 ): Promise<T> {
   const ticket = beginRead();
   try {
     const onServer = await salesOnServerFor(shopId, table, unique(ids)).catch(() => null);
-    const store = (rows: any[] | null | undefined) =>
+    const store = (rows: LocalRow[] | null | undefined) =>
       applyServerRows(shopId, table, rows || [], ticket, onServer)
         .catch(err => console.warn(`[WriteThrough] ${table}: the device copy was not updated`, err));
     return await write(store);
@@ -330,13 +369,13 @@ export const fetchLiveStock = async (
     try {
       const onServer = await salesOnServerFor(shopId, 'products', ids, signal);
       if (!onServer) return null;
-      const rows: any[] = [];
+      const rows: LocalRow[] = [];
       for (let i = 0; i < ids.length; i += ID_CHUNK) {
         let query = supabase.from('products').select('*').eq('shopId', shopId).in('id', ids.slice(i, i + ID_CHUNK)).retry(false);
         if (signal) query = query.abortSignal(signal);
         const { data, error } = await query;
         if (error || !data) return null;
-        rows.push(...data);
+        rows.push(...(data as LocalRow[]));
       }
       const current = rows.filter(r => !isArchivedRow('products', r));
       const eff = queueEffects(await db.syncQueue.toArray(), onServer);
@@ -392,19 +431,20 @@ export const refreshLocalBottles = async (shopId: string, productIds: string[]):
     const chunk = ids.slice(i, i + PRODUCT_CHUNK);
     const ticket = beginRead();
     try {
-      const rows: any[] = [];
+      const rows: LocalRow[] = [];
       try {
         for (let from = 0; ; from += 1000) {
           const { data, error } = await supabase
             .from('bottles').select('*').eq('shopId', shopId).in('productId', chunk)
             .order('id', { ascending: true }).range(from, from + 999);
           if (error) return false; // keep the old copy if the server can't be read
-          rows.push(...(data || []));
+          rows.push(...((data || []) as LocalRow[]));
           if (!data || data.length < 1000) break;
         }
       } catch {
         return false;
       }
+      const bottleTable = tableOf('bottles');
       await db.transaction('rw', db.bottles, db.syncQueue, async () => {
         const eff = queueEffects(await db.syncQueue.toArray(), new Set());
         const serverIds = new Set(rows.map(r => String(r.id)));
@@ -414,10 +454,10 @@ export const refreshLocalBottles = async (shopId: string, productIds: string[]):
           .map(b => String(b.id))
           .filter(id => mayWrite('bottles', id, ticket));
         const fresh = rows.filter(r => mayWrite('bottles', String(r.id), ticket));
-        const plan = planServerRows('bottles', fresh, await db.bottles.bulkGet(fresh.map(r => String(r.id))), eff);
-        if (gone.length) await db.bottles.bulkDelete(gone);
-        if (plan.puts.length) await db.bottles.bulkPut(plan.puts);
-        if (plan.deletes.length) await db.bottles.bulkDelete(plan.deletes);
+        const plan = planServerRows('bottles', fresh, await bottleTable.bulkGet(fresh.map(r => String(r.id))), eff);
+        if (gone.length) await bottleTable.bulkDelete(gone);
+        if (plan.puts.length) await bottleTable.bulkPut(plan.puts);
+        if (plan.deletes.length) await bottleTable.bulkDelete(plan.deletes);
         recordWrite('bottles', [...gone, ...fresh.map(r => String(r.id))], ticket);
       });
     } finally {
@@ -431,7 +471,10 @@ export const refreshLocalBottles = async (shopId: string, productIds: string[]):
  * After a sale was deleted (or edited) on the server: its products, bottles and
  * customer are read again, so the restored stock and udhaar show at once.
  */
-export async function refreshAfterSaleReversal(shopId: string, sale: any): Promise<void> {
+export async function refreshAfterSaleReversal(
+  shopId: string,
+  sale: { customerId?: unknown; items?: unknown } | null | undefined,
+): Promise<void> {
   const items = asArray(sale?.items);
   const productIds = [...new Set(items.map(i => i?.productId).filter(Boolean).map(String))];
   const eLiquidIds = [...new Set(items

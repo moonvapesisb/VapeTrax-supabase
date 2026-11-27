@@ -36,6 +36,12 @@ import Dexie from 'dexie';
 import { announceDeleted } from '../lib/liveSync';
 import { friendlyError } from '../lib/errors';
 import { REASONS, useShopPermissions } from '../lib/permissions';
+import {
+  buildOptimisticCheckoutLedger,
+  dexieFinanceStore,
+  newFinanceId,
+} from '../lib/financeAccounts';
+import { adjustAccountBalancesInStore } from '../lib/financeCore';
 
 const CART_KEY = 'vapetrax_cart';
 
@@ -658,13 +664,15 @@ const NewSale: React.FC = () => {
       }
 
       const saleId = isEditing ? editSale.id : crypto.randomUUID();
+      const ledgerEpoch = isEditing ? newFinanceId().slice(0, 8) : undefined;
       const finalSplit = paymentMethod === 'split' ? normalizeSplit(splitAmounts) : null;
-      const saleData: any = {
+      const saleData: Record<string, unknown> = {
         id: saleId, customerId: selectedCustomerId, shopId, totalAmount, totalCOGS, totalProfit,
         paymentMethod, items: saleItems, ...actorMeta, splitAmounts: finalSplit,
         saleDate: finalSaleDateIso, saleDateClient: finalSaleDateClientIso,
         createdAt: isEditing ? editSale.createdAt : timestampIso,
         updatedAt: timestampIso,
+        ...(ledgerEpoch ? { ledgerEpoch } : {}),
         // Which app build and device sent this sale (counted per build on the server).
         clientBuild: CLIENT_BUILD,
         deviceId: getDeviceId()
@@ -674,35 +682,68 @@ const NewSale: React.FC = () => {
       if (paymentMethod === 'credit') creditIncrement = totalAmount;
       else if (finalSplit) creditIncrement = finalSplit.credit;
 
-      await db.transaction('rw', db.products, db.bottles, db.syncQueue, db.customers, async () => {
-        for (const up of productUpdates) {
-          const prod = await db.products.get(up.id);
-          if (prod) await db.products.update(up.id, { stockQuantity: Math.max(0, (Number(prod.stockQuantity) || 0) - up.deduction) });
-        }
-        for (const up of bottleUpdates) {
-          const bot = await db.bottles.get(up.id);
-          if (bot) await db.bottles.update(up.id, { remainingMl: up.remainingMl, status: up.status, openedDate: up.openedDate || bot.openedDate });
-        }
-        if (selectedCustomerId && creditIncrement > 0) {
-          const cust = await db.customers.get(selectedCustomerId);
-          if (cust) await db.customers.update(selectedCustomerId, { creditBalance: (Number(cust.creditBalance) || 0) + creditIncrement });
-        }
-        await db.syncQueue.add({
-          type: 'process_checkout',
-          payload: {
-            p_shop_id: shopId,
-            p_sale_data: saleData,
-            p_inventory_logs: inventoryLogs,
-            p_bottle_updates: bottleUpdates,
-            p_product_updates: productUpdates,
-            p_customer_id: selectedCustomerId,
-            p_credit_increment: creditIncrement
-          },
-          status: 'pending',
-          createdAt: timestampIso,
-          retryCount: 0
-        });
-      });
+      await db.transaction(
+        'rw',
+        [db.products, db.bottles, db.syncQueue, db.customers, db.financeAccounts, db.financeTransactions],
+        async () => {
+          for (const up of productUpdates) {
+            const prod = await db.products.get(up.id);
+            if (prod) await db.products.update(up.id, { stockQuantity: Math.max(0, (Number(prod.stockQuantity) || 0) - up.deduction) });
+          }
+          for (const up of bottleUpdates) {
+            const bot = await db.bottles.get(up.id);
+            if (bot) await db.bottles.update(up.id, { remainingMl: up.remainingMl, status: up.status, openedDate: up.openedDate || bot.openedDate });
+          }
+          if (selectedCustomerId && creditIncrement > 0) {
+            const cust = await db.customers.get(selectedCustomerId);
+            if (cust) await db.customers.update(selectedCustomerId, { creditBalance: (Number(cust.creditBalance) || 0) + creditIncrement });
+          }
+
+          const shopAccounts = (await db.financeAccounts.where('ownerShopId').equals(shopId).toArray())
+            .filter((acc) => !acc.isArchived);
+          const cashAccount = shopAccounts.find((acc) => acc.type === 'shopCash') ?? null;
+          const primaryOnlineAccount = shopAccounts.find((acc) => acc.type === 'primaryOnline') ?? null;
+          const ledger = buildOptimisticCheckoutLedger({
+            shopId,
+            saleId: String(saleId),
+            ledgerEpoch,
+            paymentMethod,
+            totalAmount,
+            splitAmounts: finalSplit,
+            actor: {
+              createdBy: actorMeta.createdBy ?? null,
+              actorRole: actorMeta.actorRole === 'cashier' ? 'cashier' : 'admin',
+              actorName: String(actorMeta.actorName ?? 'System'),
+            },
+            cashAccount,
+            primaryOnlineAccount,
+            occurredAt: finalSaleDateIso,
+          });
+          if (ledger.txs.length > 0) {
+            await db.financeTransactions.bulkPut(ledger.txs);
+            if (ledger.rollback.txEffects?.length) {
+              await adjustAccountBalancesInStore(dexieFinanceStore, ledger.rollback.txEffects, 1);
+            }
+          }
+
+          await db.syncQueue.add({
+            type: 'process_checkout',
+            payload: {
+              p_shop_id: shopId,
+              p_sale_data: saleData,
+              p_inventory_logs: inventoryLogs,
+              p_bottle_updates: bottleUpdates,
+              p_product_updates: productUpdates,
+              p_customer_id: selectedCustomerId,
+              p_credit_increment: creditIncrement
+            },
+            localRollback: ledger.rollback,
+            status: 'pending',
+            createdAt: timestampIso,
+            retryCount: 0
+          });
+        },
+      );
 
       setCart([]);
       setSelectedCustomerId(null);

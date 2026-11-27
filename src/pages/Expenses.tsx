@@ -1,51 +1,91 @@
-import React, { useState, useMemo } from 'react';
-import { 
-  DollarSign, 
-  Search, 
-  Plus, 
+import React, { useState, useMemo, useEffect } from 'react';
+import {
+  DollarSign,
+  Search,
+  Plus,
   Edit2,
-  Filter, 
-  Trash2, 
-  Calendar, 
-  Tag, 
-  ArrowUpDown,
+  Trash2,
+  Tag,
   X,
   Clock,
   TrendingDown,
-  Wallet
+  Wallet,
+  Building2,
 } from 'lucide-react';
-import { useSupabaseOnce } from '../hooks/useSupabaseOnce';
+import { useLiveQuery } from 'dexie-react-hooks';
 import { formatCurrency, cn } from '../lib/utils';
 import LoadingSpinner from '../components/ui/LoadingSpinner';
-import { supabase } from '../lib/supabase';
 import { useAuth } from '../contexts/AuthContext';
 import toast from 'react-hot-toast';
 import { buildActorMeta } from '../lib/actor';
 import { toDisplayDate } from '../lib/dates';
 import ConfirmBulkDeleteModal from '../components/ui/ConfirmBulkDeleteModal';
 import { reauthenticateForSensitiveAction, requiresPasswordReauth } from '../lib/secureAction';
-import { announceDeleted, notifyTableChanged } from '../lib/liveSync';
 import { friendlyError } from '../lib/errors';
 import { MAX_DELETE_AT_ONCE, REASONS, useShopPermissions } from '../lib/permissions';
+import { db, type ExpenseRow, type FinanceAccountRow } from '../lib/db';
+import { syncFinanceFromCloud } from '../lib/sync';
+import {
+  canWriteFinanceAccount,
+  deleteExpenseWithAccount,
+  recordExpenseWithAccount,
+  updateExpenseWithAccount,
+  type ActorMeta,
+} from '../lib/financeAccounts';
 
 const MASS_DELETE_MESSAGE =
   `For safety, at most ${MAX_DELETE_AT_ONCE} expenses can be deleted at once. Nothing was deleted: select ${MAX_DELETE_AT_ONCE} or fewer and try again.`;
 
 const Expenses: React.FC = () => {
-  const { shopId, currentUser } = useAuth();
-  // A cashier adds expenses; editing and deleting them is for the admin.
+  const { shopId, currentUser, userRole } = useAuth();
+  // A cashier adds expenses (from Shop Cash only); editing and deleting them is for the admin.
   const isCashier = !useShopPermissions().canEditExpenses;
   const needsPassword = requiresPasswordReauth(currentUser);
-  const { documents: expenses, loading } = useSupabaseOnce(
-    shopId ? 'expenses' : null, 
-    shopId ? [{ column: 'shopId', operator: 'eq', value: shopId }] : [],
-    { column: 'expenseDate', ascending: false },
-    200
+
+  const expensesRaw = useLiveQuery(
+    () => (shopId ? db.expenses.where('shopId').equals(shopId).toArray() : Promise.resolve([])),
+    [shopId],
   );
+  const allAccounts = useLiveQuery(() => db.financeAccounts.toArray(), []);
+
+  useEffect(() => {
+    if (!shopId || !navigator.onLine) return;
+    void syncFinanceFromCloud(shopId);
+  }, [shopId]);
+
+  const expenses = useMemo(() => {
+    const list = expensesRaw || [];
+    return [...list].sort((a, b) => {
+      const ta = toDisplayDate(a.expenseDate, a.createdAtClient)?.getTime() ?? 0;
+      const tb = toDisplayDate(b.expenseDate, b.createdAtClient)?.getTime() ?? 0;
+      return tb - ta;
+    });
+  }, [expensesRaw]);
+
+  const accountById = useMemo(
+    () => new Map<string, FinanceAccountRow>((allAccounts || []).map((a) => [a.id, a])),
+    [allAccounts],
+  );
+
+  const writableAccounts = useMemo(() => {
+    if (!shopId) return [];
+    const order: Record<string, number> = { shopCash: 0, primaryOnline: 1, secondaryBank: 2 };
+    return (allAccounts || [])
+      .filter((a) => !a.isArchived && canWriteFinanceAccount(a, shopId, !isCashier))
+      .sort((a, b) => {
+        const ownDiff = Number(a.ownerShopId !== shopId) - Number(b.ownerShopId !== shopId);
+        if (ownDiff !== 0) return ownDiff;
+        const typeDiff = (order[a.type] ?? 9) - (order[b.type] ?? 9);
+        if (typeDiff !== 0) return typeDiff;
+        return a.name.localeCompare(b.name);
+      });
+  }, [allAccounts, shopId, isCashier]);
+
+  const loading = expensesRaw === undefined || allAccounts === undefined;
   const [searchTerm, setSearchTerm] = useState('');
   const [categoryFilter, setCategoryFilter] = useState('all');
   const [showAddModal, setShowAddModal] = useState(false);
-  const [editingExpense, setEditingExpense] = useState<any | null>(null);
+  const [editingExpense, setEditingExpense] = useState<ExpenseRow | null>(null);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [showBulkDeleteModal, setShowBulkDeleteModal] = useState(false);
   const [deleteTyped, setDeleteTyped] = useState('');
@@ -53,26 +93,38 @@ const Expenses: React.FC = () => {
   const [bulkDeleting, setBulkDeleting] = useState(false);
 
   const filteredExpenses = useMemo(() => {
-    return expenses.filter(e => 
-      (e.description?.toLowerCase().includes(searchTerm.toLowerCase()) || 
+    return expenses.filter(e =>
+      (e.description?.toLowerCase().includes(searchTerm.toLowerCase()) ||
        e.category?.toLowerCase().includes(searchTerm.toLowerCase())) &&
       (categoryFilter === 'all' || e.category === categoryFilter)
     );
   }, [expenses, searchTerm, categoryFilter]);
 
-  const handleDelete = async (id: string) => {
+  const buildActor = (): ActorMeta => {
+    const raw = buildActorMeta({ currentUser, userRole });
+    return {
+      createdBy: raw.createdBy,
+      actorRole: raw.actorRole === 'cashier' ? 'cashier' : 'admin',
+      actorName: raw.actorName,
+    };
+  };
+
+  const handleDelete = async (expense: ExpenseRow) => {
     if (isCashier) {
       toast.error(REASONS.editExpenses);
       return;
     }
-    if (window.confirm('Are you sure you want to delete this expense?')) {
+    if (!shopId) return;
+    if (window.confirm('Are you sure you want to delete this expense? Any linked account debit will be refunded.')) {
       try {
-        const { error } = await supabase.from('expenses').delete().eq('id', id);
-        if (error) throw error;
-        toast.success('Expense deleted successfully');
-        // This device's lists read again at once; the shop's other devices are told.
-        announceDeleted('expenses', [id]);
-      } catch (error) {
+        await deleteExpenseWithAccount({
+          shopId,
+          expenseId: expense.id,
+          actor: buildActor(),
+          existingExpense: expense,
+        });
+        toast.success('Expense deleted and account refunded');
+      } catch (error: unknown) {
         console.error('Expense delete error:', error);
         toast.error(friendlyError(error, 'The expense could not be deleted. Please try again.'));
       }
@@ -86,7 +138,7 @@ const Expenses: React.FC = () => {
   };
 
   const handleBulkDelete = async () => {
-    if (isCashier) return;
+    if (isCashier || !shopId) return;
     if (!selectedIds.length) return;
     if (selectedIds.length > MAX_DELETE_AT_ONCE) {
       toast.error(MASS_DELETE_MESSAGE);
@@ -98,15 +150,17 @@ const Expenses: React.FC = () => {
       if (needsPassword && currentUser) {
         await reauthenticateForSensitiveAction(currentUser, deletePassword);
       }
-      const { error } = await supabase.from('expenses').delete().in('id', ids);
-      if (error) throw error;
+      const actor = buildActor();
+      for (const id of ids) {
+        const exp = expenses.find((e) => e.id === id);
+        await deleteExpenseWithAccount({ shopId, expenseId: id, actor, existingExpense: exp });
+      }
       toast.success(`Deleted ${ids.length} expense(s)`);
       setSelectedIds([]);
       setShowBulkDeleteModal(false);
       setDeleteTyped('');
       setDeletePassword('');
-      announceDeleted('expenses', ids);
-    } catch (error: any) {
+    } catch (error: unknown) {
       console.error('Expense bulk delete error:', error);
       toast.error(friendlyError(error, 'The selected expenses could not be deleted. Please try again.'));
     } finally {
@@ -222,6 +276,7 @@ const Expenses: React.FC = () => {
                 <th className="px-6 py-4 text-[10px] font-bold text-slate-400 uppercase tracking-widest">Category</th>
                 <th className="px-6 py-4 text-[10px] font-bold text-slate-400 uppercase tracking-widest">Description</th>
                 <th className="px-6 py-4 text-[10px] font-bold text-slate-400 uppercase tracking-widest">Amount</th>
+                <th className="px-6 py-4 text-[10px] font-bold text-slate-400 uppercase tracking-widest">Paid From</th>
                 <th className="px-6 py-4 text-[10px] font-bold text-slate-400 uppercase tracking-widest">Date</th>
                 <th className="px-6 py-4 text-[10px] font-bold text-slate-400 uppercase tracking-widest">By</th>
                 {!isCashier && (
@@ -247,6 +302,16 @@ const Expenses: React.FC = () => {
                   </td>
                   <td className="px-6 py-4 text-sm text-slate-600">{expense.description}</td>
                   <td className="px-6 py-4 text-sm text-red-600 font-bold">{formatCurrency(expense.amount)}</td>
+                  <td className="px-6 py-4 text-xs font-semibold text-slate-600">
+                    {expense.paidFromAccountId ? (
+                      <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-slate-100 text-slate-700">
+                        <Building2 size={12} className="text-slate-400" />
+                        {accountById.get(expense.paidFromAccountId)?.name ?? 'Account'}
+                      </span>
+                    ) : (
+                      <span className="text-slate-400">Legacy (Unlinked)</span>
+                    )}
+                  </td>
                   <td className="px-6 py-4 text-sm text-slate-500">
                     <div className="flex items-center gap-1">
                       <Clock size={14} className="text-slate-400" />
@@ -284,7 +349,7 @@ const Expenses: React.FC = () => {
                           <Edit2 size={18} />
                         </button>
                         <button 
-                          onClick={() => handleDelete(expense.id)}
+                          onClick={() => handleDelete(expense)}
                           className="p-2 hover:bg-red-50 rounded-lg text-slate-400 hover:text-red-600 transition-all" 
                           title="Delete"
                         >
@@ -312,9 +377,11 @@ const Expenses: React.FC = () => {
       {(showAddModal || (!isCashier && editingExpense)) && (
         <AddExpenseModal
           categories={categories}
-          expense={isCashier ? undefined : editingExpense}
+          accounts={writableAccounts}
+          isCashier={isCashier}
+          shopId={shopId}
+          expense={isCashier ? undefined : editingExpense ?? undefined}
           onClose={() => {
-            // A saved expense makes the list read again by itself (notifyTableChanged).
             setShowAddModal(false);
             setEditingExpense(null);
           }}
@@ -344,24 +411,46 @@ const Expenses: React.FC = () => {
   );
 };
 
-const AddExpenseModal: React.FC<{ categories: string[], expense?: any, onClose: () => void }> = ({ categories, expense, onClose }) => {
-  const { shopId, currentUser, userRole } = useAuth();
+const AddExpenseModal: React.FC<{
+  categories: string[];
+  accounts: FinanceAccountRow[];
+  isCashier: boolean;
+  shopId: string | null;
+  expense?: ExpenseRow;
+  onClose: () => void;
+}> = ({ categories, accounts, isCashier, shopId, expense, onClose }) => {
+  const { currentUser, userRole } = useAuth();
   const isEditing = !!expense;
+  const shopCashAccount = accounts.find((a) => a.type === 'shopCash' && a.ownerShopId === shopId) ?? accounts[0];
+
   const [formData, setFormData] = useState({
     category: expense?.category || 'Miscellaneous',
     description: expense?.description || '',
     amount: isEditing ? (expense?.amount || 0) : '' as number | string,
-    expenseDate: expense?.expenseDate?.toDate
-      ? expense.expenseDate.toDate().toISOString().split('T')[0]
-      : expense?.expenseDate
-        ? new Date(expense.expenseDate).toISOString().split('T')[0]
-        : new Date().toISOString().split('T')[0]
+    accountId: isEditing ? (expense?.paidFromAccountId ?? '') : (shopCashAccount?.id ?? ''),
+    expenseDate: expense?.expenseDate
+      ? new Date(expense.expenseDate).toISOString().split('T')[0]
+      : new Date().toISOString().split('T')[0],
   });
   const [saving, setSaving] = useState(false);
 
+  const selectedAccount = accounts.find((a) => a.id === formData.accountId) ?? null;
+  const oldAmount = isEditing ? Math.round(Number(expense?.amount) || 0) : 0;
+  const parsedAmount = Number(formData.amount) || 0;
+  const effectiveAvailable = selectedAccount
+    ? Math.round(Number(selectedAccount.balance) || 0) +
+      (isEditing && expense?.paidFromAccountId === selectedAccount.id ? oldAmount : 0)
+    : 0;
+  const needsDebitCheck =
+    Boolean(selectedAccount) &&
+    (!isEditing ||
+      expense?.paidFromAccountId == null ||
+      expense.paidFromAccountId !== formData.accountId ||
+      parsedAmount !== oldAmount);
+  const exceedsAvailable = needsDebitCheck && parsedAmount > effectiveAvailable;
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    // Guard: shopId must be resolved before writing
     if (!shopId) {
       toast.error('Shop not loaded yet. Please wait a moment and try again.');
       return;
@@ -375,43 +464,55 @@ const AddExpenseModal: React.FC<{ categories: string[], expense?: any, onClose: 
       toast.error('Amounts are in whole rupees (no paisa).');
       return;
     }
+    if (!isEditing && !formData.accountId) {
+      toast.error('Please select a payment account.');
+      return;
+    }
+    if (isCashier && selectedAccount && selectedAccount.type !== 'shopCash') {
+      toast.error('Cashiers can only choose Shop Cash for expenses.');
+      return;
+    }
+    if (exceedsAvailable && selectedAccount) {
+      toast.error(`Insufficient balance in ${selectedAccount.name} (available: ${formatCurrency(effectiveAvailable)}).`);
+      return;
+    }
+
     setSaving(true);
     try {
-      const actorMeta = buildActorMeta({ currentUser, userRole });
-      if (isEditing) {
-        const { data: updated, error } = await supabase.from('expenses').update({
-          ...formData,
-          amount,
+      const rawActor = buildActorMeta({ currentUser, userRole });
+      const actor: ActorMeta = {
+        createdBy: rawActor.createdBy,
+        actorRole: rawActor.actorRole === 'cashier' ? 'cashier' : 'admin',
+        actorName: rawActor.actorName,
+      };
+      const expenseDateIso = new Date(formData.expenseDate).toISOString();
+      if (isEditing && expense) {
+        await updateExpenseWithAccount({
           shopId,
-          expenseDate: new Date(formData.expenseDate).toISOString(),
-          createdAtClient: new Date().toISOString(),
-          ...actorMeta,
-          updatedAt: new Date().toISOString()
-        }).eq('id', expense.id).select('id');
-        if (error) throw error;
-        if (!updated || updated.length === 0) {
-          notifyTableChanged('expenses');
-          throw new Error('This expense was deleted on another device, so nothing was saved.');
-        }
+          expenseId: expense.id,
+          category: formData.category,
+          description: formData.description,
+          amount,
+          expenseDate: expenseDateIso,
+          accountId: formData.accountId || null,
+          actor,
+          existingExpense: expense,
+        });
         toast.success('Expense updated successfully');
       } else {
-        const { error } = await supabase.from('expenses').insert({
-          id: crypto.randomUUID(),
-          ...formData,
-          amount,
+        await recordExpenseWithAccount({
           shopId,
-          expenseDate: new Date(formData.expenseDate).toISOString(),
-          createdAtClient: new Date().toISOString(),
-          ...actorMeta,
-          createdAt: new Date().toISOString()
+          category: formData.category,
+          description: formData.description,
+          amount,
+          expenseDate: expenseDateIso,
+          accountId: formData.accountId,
+          actor,
         });
-        if (error) throw error;
         toast.success('Expense recorded successfully');
       }
-      // Write-through: every expense list on this device reads again at once.
-      notifyTableChanged('expenses');
       onClose();
-    } catch (error: any) {
+    } catch (error: unknown) {
       console.error('Expense save error:', error);
       toast.error(friendlyError(error, 'The expense could not be saved. Please try again.'));
     } finally {
@@ -429,6 +530,45 @@ const AddExpenseModal: React.FC<{ categories: string[], expense?: any, onClose: 
           </button>
         </div>
         <form onSubmit={handleSubmit} className="p-6 space-y-5">
+          <div className="space-y-2">
+            <label className="text-xs font-bold text-slate-400 uppercase tracking-widest ml-1">Paid From</label>
+            <select
+              required={!isEditing}
+              disabled={isCashier}
+              value={formData.accountId}
+              onChange={(e) => setFormData({ ...formData, accountId: e.target.value })}
+              className={cn(
+                "w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl text-slate-900 focus:outline-none focus:ring-2 focus:ring-violet-500/20 transition-all",
+                isCashier && "opacity-75 cursor-not-allowed"
+              )}
+            >
+              {isEditing && expense?.paidFromAccountId == null && (
+                <option value="">Legacy (Unlinked — no ledger entry)</option>
+              )}
+              {accounts.map((acc) => {
+                const avail =
+                  Math.round(Number(acc.balance) || 0) +
+                  (isEditing && expense?.paidFromAccountId === acc.id ? oldAmount : 0);
+                const sharedTag = acc.ownerShopId !== shopId ? ' · Shared' : '';
+                return (
+                  <option key={acc.id} value={acc.id}>
+                    {acc.name}{sharedTag} (Avail: {formatCurrency(avail)})
+                  </option>
+                );
+              })}
+            </select>
+            {isCashier && (
+              <p className="text-[11px] font-medium text-slate-500 ml-1">
+                Cashiers can only record expenses from Shop Cash.
+              </p>
+            )}
+            {exceedsAvailable && selectedAccount && (
+              <p className="text-xs font-semibold text-rose-600 ml-1">
+                Amount exceeds {selectedAccount.name} available balance ({formatCurrency(effectiveAvailable)}).
+              </p>
+            )}
+          </div>
+
           <div className="space-y-2">
             <label className="text-xs font-bold text-slate-400 uppercase tracking-widest ml-1">Category</label>
             <select 
@@ -489,7 +629,7 @@ const AddExpenseModal: React.FC<{ categories: string[], expense?: any, onClose: 
             </button>
             <button 
               type="submit"
-              disabled={saving || !shopId}
+              disabled={saving || !shopId || exceedsAvailable || (!isEditing && !formData.accountId)}
               className="flex-1 py-4 px-4 bg-violet-600 hover:bg-violet-700 text-white font-bold rounded-xl shadow-lg shadow-violet-600/20 transition-all uppercase tracking-widest text-xs disabled:opacity-50 disabled:cursor-not-allowed"
             >
               {saving ? 'Saving...' : isEditing ? 'Update Expense' : 'Record Expense'}

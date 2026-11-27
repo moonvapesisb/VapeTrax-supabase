@@ -234,12 +234,23 @@ begin
     perform pg_temp.act_as('5a0e5a0e-0000-4000-8000-00000000000a');
     insert into public.finance_accounts (id, "shopId", name) values ('smokeA-fa', '5a0e5a0e-0000-4000-8000-00000000000a', 'x');
     perform pg_temp.act_as_owner();
-    perform pg_temp.check('unused tables are closed (finance_accounts)', false);
+    perform pg_temp.check('finance_accounts rejects direct app inserts (SELECT-only)', false);
   exception when insufficient_privilege then
     null;
   end;
   perform pg_temp.act_as_owner();
-  perform pg_temp.check('unused tables are closed (finance_accounts)', true);
+  perform pg_temp.check('finance_accounts rejects direct app inserts (SELECT-only)', true);
+
+  begin
+    perform pg_temp.act_as('5a0e5a0e-0000-4000-8000-00000000000a');
+    insert into public.daily_summaries (id, "shopId") values ('smokeA-ds', '5a0e5a0e-0000-4000-8000-00000000000a');
+    perform pg_temp.act_as_owner();
+    perform pg_temp.check('unused tables are closed (daily_summaries)', false);
+  exception when insufficient_privilege then
+    null;
+  end;
+  perform pg_temp.act_as_owner();
+  perform pg_temp.check('unused tables are closed (daily_summaries)', true);
 
   begin
     execute 'set local role anon';

@@ -25,7 +25,12 @@ import {
 } from './bottles';
 import { getCreditBalanceDelta } from './credits';
 import { deleteSaleWithReversal } from './salesReversal';
-import { getAggregatedFinancialData } from './finance-system';
+import { db as dexieDb } from './db';
+import {
+  FINANCE_ACCOUNT_TYPE_LABELS,
+  type FinanceAccountType,
+  summarizeVisibleFinanceView,
+} from './financeAccounts';
 import { exportBackup } from './backup';
 import { scanRoughbookImage } from './aiVision';
 import { getDiscountedUnitPrice, getProductDiscountPercent } from './utils';
@@ -1675,20 +1680,38 @@ export async function executeAgentTool(
       }
 
       case 'get_finance_summary': {
-        const { accounts } = await getAggregatedFinancialData(ctx.shopId);
-        const mappedAccounts = accounts.map((a) => ({
+        const [accounts, transactions, linkedSummaries] = await Promise.all([
+          dexieDb.financeAccounts.toArray(),
+          dexieDb.financeTransactions.toArray(),
+          dexieDb.linkedShopSummaries.toArray(),
+        ]);
+        const view = summarizeVisibleFinanceView({
+          accounts,
+          transactions,
+          linkedSummaries,
+          shopId: ctx.shopId,
+          isAdmin: ctx.userRole === 'admin',
+        });
+        const mappedAccounts = view.activeAccounts.map((a) => ({
           id: a.id,
-          name: a.name,
-          category: a.category,
+          name:
+            a.ownerShopId !== ctx.shopId
+              ? `${a.name} (${view.shopLabelById.get(a.ownerShopId) ?? 'Shared'})`
+              : a.name,
+          category: FINANCE_ACCOUNT_TYPE_LABELS[a.type as FinanceAccountType] ?? a.type,
           balance: a.balance,
         }));
         return {
           ok: true,
-          summary: `Loaded ${accounts.length} financial ledger accounts`,
-          data: { accounts: mappedAccounts },
+          summary: `Loaded ${mappedAccounts.length} financial accounts (combined total: Rs ${view.combinedTotals.combinedTotal})`,
+          data: {
+            accounts: mappedAccounts,
+            combinedTotals: view.combinedTotals,
+            mismatches: view.mismatches,
+          },
           visualCard: {
             type: 'finance_overview',
-            title: 'Shop Financial Ledger & Drawers',
+            title: 'Shop Cash & Bank Accounts',
             accounts: mappedAccounts,
           },
         };

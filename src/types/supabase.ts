@@ -1,4 +1,4 @@
-﻿export type Json =
+export type Json =
   | string
   | number
   | boolean
@@ -54,6 +54,7 @@ export type Database = {
         Row: {
           actorName: string | null
           actorRole: string | null
+          accountId: string | null
           amount: number
           createdAt: string | null
           createdAtClient: string | null
@@ -64,6 +65,7 @@ export type Database = {
           entityContact: string | null
           entityName: string | null
           id: string
+          paymentMethod: string | null
           shopId: string
           supplierId: string | null
           transactionType: string | null
@@ -71,6 +73,7 @@ export type Database = {
         Insert: {
           actorName?: string | null
           actorRole?: string | null
+          accountId?: string | null
           amount?: number
           createdAt?: string | null
           createdAtClient?: string | null
@@ -81,6 +84,7 @@ export type Database = {
           entityContact?: string | null
           entityName?: string | null
           id: string
+          paymentMethod?: string | null
           shopId: string
           supplierId?: string | null
           transactionType?: string | null
@@ -88,6 +92,7 @@ export type Database = {
         Update: {
           actorName?: string | null
           actorRole?: string | null
+          accountId?: string | null
           amount?: number
           createdAt?: string | null
           createdAtClient?: string | null
@@ -98,6 +103,7 @@ export type Database = {
           entityContact?: string | null
           entityName?: string | null
           id?: string
+          paymentMethod?: string | null
           shopId?: string
           supplierId?: string | null
           transactionType?: string | null
@@ -109,6 +115,9 @@ export type Database = {
           createdAt: string | null
           createdAtClient: string | null
           creditBalance: number | null
+          deletedAt: string | null
+          deletedBy: string | null
+          deleteReason: string | null
           email: string | null
           id: string
           name: string
@@ -120,6 +129,9 @@ export type Database = {
           createdAt?: string | null
           createdAtClient?: string | null
           creditBalance?: number | null
+          deletedAt?: string | null
+          deletedBy?: string | null
+          deleteReason?: string | null
           email?: string | null
           id: string
           name: string
@@ -131,6 +143,9 @@ export type Database = {
           createdAt?: string | null
           createdAtClient?: string | null
           creditBalance?: number | null
+          deletedAt?: string | null
+          deletedBy?: string | null
+          deleteReason?: string | null
           email?: string | null
           id?: string
           name?: string
@@ -176,7 +191,9 @@ export type Database = {
           description: string | null
           expenseDate: string | null
           id: string
+          paidFromAccountId: string | null
           shopId: string
+          updatedAt: string | null
         }
         Insert: {
           actorName?: string | null
@@ -189,7 +206,9 @@ export type Database = {
           description?: string | null
           expenseDate?: string | null
           id: string
+          paidFromAccountId?: string | null
           shopId: string
+          updatedAt?: string | null
         }
         Update: {
           actorName?: string | null
@@ -202,70 +221,129 @@ export type Database = {
           description?: string | null
           expenseDate?: string | null
           id?: string
+          paidFromAccountId?: string | null
           shopId?: string
+          updatedAt?: string | null
         }
         Relationships: []
       }
       finance_accounts: {
         Row: {
-          balance: number | null
-          createdAt: string | null
+          accountNumber: string | null
+          archivedAt: string | null
+          balance: number
+          bankName: string | null
+          createdAt: string
           id: string
-          name: string | null
+          isArchived: boolean
+          isOverdrawn: boolean
+          name: string
+          ownerShopId: string
           shopId: string
-          type: string | null
+          type: string
+          updatedAt: string
         }
         Insert: {
-          balance?: number | null
-          createdAt?: string | null
-          id: string
-          name?: string | null
+          accountNumber?: string | null
+          archivedAt?: string | null
+          balance?: number
+          bankName?: string | null
+          createdAt?: string
+          id?: string
+          isArchived?: boolean
+          isOverdrawn?: boolean
+          name: string
+          ownerShopId: string
           shopId: string
-          type?: string | null
+          type: string
+          updatedAt?: string
         }
         Update: {
-          balance?: number | null
-          createdAt?: string | null
+          accountNumber?: string | null
+          archivedAt?: string | null
+          balance?: number
+          bankName?: string | null
+          createdAt?: string
           id?: string
-          name?: string | null
+          isArchived?: boolean
+          isOverdrawn?: boolean
+          name?: string
+          ownerShopId?: string
           shopId?: string
-          type?: string | null
+          type?: string
+          updatedAt?: string
         }
         Relationships: []
       }
       finance_transactions: {
         Row: {
-          accountId: string | null
-          amount: number | null
-          createdAt: string | null
+          accountId: string
+          actorName: string | null
+          actorRole: string | null
+          amount: number
+          category: string | null
+          counterpartyAccountId: string | null
+          createdAt: string
+          createdBy: string | null
           description: string | null
+          direction: string
           id: string
+          notes: string | null
+          occurredAt: string
+          ownerShopId: string
+          paidTo: string | null
           referenceId: string | null
           referenceType: string | null
           shopId: string
-          type: string | null
+          transferId: string | null
+          type: string
+          updatedAt: string
         }
         Insert: {
-          accountId?: string | null
-          amount?: number | null
-          createdAt?: string | null
+          accountId: string
+          actorName?: string | null
+          actorRole?: string | null
+          amount: number
+          category?: string | null
+          counterpartyAccountId?: string | null
+          createdAt?: string
+          createdBy?: string | null
           description?: string | null
-          id: string
+          direction: string
+          id?: string
+          notes?: string | null
+          occurredAt?: string
+          ownerShopId: string
+          paidTo?: string | null
           referenceId?: string | null
           referenceType?: string | null
           shopId: string
-          type?: string | null
+          transferId?: string | null
+          type: string
+          updatedAt?: string
         }
         Update: {
-          accountId?: string | null
-          amount?: number | null
-          createdAt?: string | null
+          accountId?: string
+          actorName?: string | null
+          actorRole?: string | null
+          amount?: number
+          category?: string | null
+          counterpartyAccountId?: string | null
+          createdAt?: string
+          createdBy?: string | null
           description?: string | null
+          direction?: string
           id?: string
+          notes?: string | null
+          occurredAt?: string
+          ownerShopId?: string
+          paidTo?: string | null
           referenceId?: string | null
           referenceType?: string | null
           shopId?: string
-          type?: string | null
+          transferId?: string | null
+          type?: string
+          updatedAt?: string
         }
         Relationships: [
           {
@@ -651,6 +729,27 @@ export type Database = {
         }
         Relationships: []
       }
+      shop_links: {
+        Row: {
+          createdAt: string
+          createdBy: string | null
+          shopA: string
+          shopB: string
+        }
+        Insert: {
+          createdAt?: string
+          createdBy?: string | null
+          shopA: string
+          shopB: string
+        }
+        Update: {
+          createdAt?: string
+          createdBy?: string | null
+          shopA?: string
+          shopB?: string
+        }
+        Relationships: []
+      }
       stock_alerts: {
         Row: {
           active: boolean | null
@@ -751,6 +850,43 @@ export type Database = {
       [_ in never]: never
     }
     Functions: {
+      archive_finance_account: {
+        Args: {
+          p_id: string
+        }
+        Returns: Json
+      }
+      create_finance_account: {
+        Args: {
+          p_account_number?: string | null
+          p_bank_name?: string | null
+          p_id: string
+          p_name: string
+          p_opening_balance?: number
+          p_opening_tx_id?: string | null
+          p_shop_id: string
+          p_type: string
+        }
+        Returns: Json
+      }
+      delete_expense: {
+        Args: {
+          p_expense_id: string
+          p_rev_tx_id?: string | null
+          p_shop_id: string
+        }
+        Returns: Json
+      }
+      ensure_shop_finance_accounts: {
+        Args: {
+          p_shop_id?: string | null
+        }
+        Returns: Json
+      }
+      get_linked_shops_finance_summary: {
+        Args: Record<PropertyKey, never>
+        Returns: Json
+      }
       process_checkout: {
         Args: {
           p_bottle_updates: Json
@@ -761,7 +897,7 @@ export type Database = {
           p_sale_data: Json
           p_shop_id: string
         }
-        Returns: undefined
+        Returns: Json
       }
       process_reversal: {
         Args: {
@@ -774,7 +910,7 @@ export type Database = {
           p_sale_id: string
           p_shop_id: string
         }
-        Returns: undefined
+        Returns: Json
       }
       process_stock_adjustment: {
         Args: {
@@ -786,6 +922,104 @@ export type Database = {
           p_shop_id: string
         }
         Returns: undefined
+      }
+      record_credit_payment: {
+        Args: {
+          p_amount: number
+          p_credit_id: string
+          p_customer_id: string
+          p_description?: string | null
+          p_payment_method?: string
+          p_shop_id: string
+          p_tx_id: string
+        }
+        Returns: Json
+      }
+      record_expense: {
+        Args: {
+          p_account_id: string
+          p_amount: number
+          p_category: string
+          p_description: string
+          p_expense_date: string
+          p_expense_id: string
+          p_shop_id: string
+          p_tx_id: string
+        }
+        Returns: Json
+      }
+      record_opening_balance: {
+        Args: {
+          p_account_id: string
+          p_amount: number
+          p_id: string
+          p_notes?: string | null
+          p_occurred_at?: string | null
+          p_shop_id: string
+        }
+        Returns: Json
+      }
+      record_payout: {
+        Args: {
+          p_account_id: string
+          p_amount: number
+          p_category: string
+          p_description?: string | null
+          p_id: string
+          p_notes?: string | null
+          p_occurred_at?: string | null
+          p_paid_to: string
+          p_shop_id: string
+        }
+        Returns: Json
+      }
+      reverse_finance_transaction: {
+        Args: {
+          p_id: string
+          p_occurred_at?: string | null
+          p_original_tx_id: string
+          p_reason: string
+          p_shop_id: string
+        }
+        Returns: Json
+      }
+      transfer_funds: {
+        Args: {
+          p_amount: number
+          p_description?: string | null
+          p_from_account_id: string
+          p_in_tx_id: string
+          p_notes?: string | null
+          p_occurred_at?: string | null
+          p_out_tx_id: string
+          p_shop_id: string
+          p_to_account_id: string
+          p_transfer_id: string
+        }
+        Returns: Json
+      }
+      update_expense: {
+        Args: {
+          p_account_id?: string | null
+          p_amount: number
+          p_category: string
+          p_description: string
+          p_expense_date: string
+          p_expense_id: string
+          p_new_tx_id?: string | null
+          p_rev_tx_id?: string | null
+          p_shop_id: string
+        }
+        Returns: Json
+      }
+      update_finance_account: {
+        Args: {
+          p_account_number?: string | null
+          p_bank_name?: string | null
+          p_id: string
+          p_name: string
+        }
+        Returns: Json
       }
     }
     Enums: {
